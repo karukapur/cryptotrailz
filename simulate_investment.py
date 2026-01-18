@@ -17,6 +17,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import numpy as np
 import pandas as pd
 import requests
+from requests import RequestException
 
 try:
     import yfinance as yf
@@ -28,6 +29,7 @@ except ImportError as exc:  # pragma: no cover - handled at runtime
 import matplotlib.pyplot as plt
 
 COINGECKO_API = "https://api.coingecko.com/api/v3"
+COINCAP_API = "https://api.coincap.io/v2"
 # Treat cached data with fewer than 80% of expected rows as invalid.
 EXPECTED_COMPLETENESS_RATIO = 0.8
 
@@ -56,6 +58,11 @@ def build_coingecko_url(path: str) -> str:
     return urljoin(base, path.lstrip("/"))
 
 
+def build_coincap_url(path: str) -> str:
+    base = COINCAP_API.rstrip("/") + "/"
+    return urljoin(base, path.lstrip("/"))
+
+
 @dataclass
 class SimulationConfig:
     days: int = 444
@@ -68,7 +75,7 @@ class SimulationConfig:
 
 def read_csv_if_exists(path: Path) -> pd.DataFrame | None:
     if path.exists():
-        return pd.read_csv(path, index_col=0, parse_dates=True)
+        return pd.read_csv(path, index_col=0, parse_dates=[0])
     return None
 
 
@@ -94,6 +101,11 @@ def _request_json_with_retry(
             return _request_json(url, params=params, headers=headers)
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response else None
+            if status == 401:
+                raise SystemExit(
+                    "CoinGecko API request returned 401 Unauthorized. "
+                    "Verify COINGECKO_DEMO_API_KEY is set and valid."
+                ) from exc
             if status in {429, 500, 502, 503, 504} and attempt < 2:
                 time.sleep(2 ** attempt)
                 continue
@@ -108,7 +120,7 @@ def fetch_top_coins(
 ) -> pd.DataFrame:
     cache_dir = cache_dir or Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
-    cache_path = cache_dir / f"top_coins_{limit}_{cache_tag}.csv"
+    cache_path = cache_dir / f"coingecko_top_coins_{limit}_{cache_tag}.csv"
     if not refresh:
         cached = read_csv_if_exists(cache_path)
         if cached is not None and len(cached) >= int(limit * EXPECTED_COMPLETENESS_RATIO):
@@ -148,6 +160,14 @@ def _validate_cache_length(df: pd.DataFrame, expected_rows: int) -> bool:
     return len(df) >= int(expected_rows * EXPECTED_COMPLETENESS_RATIO)
 
 
+def _validate_series(series: pd.Series, expected_rows: int) -> bool:
+    if len(series) < int(expected_rows * EXPECTED_COMPLETENESS_RATIO):
+        return False
+    if series.isna().mean() > 0.2:
+        return False
+    return True
+
+
 def fetch_coin_history(
     coin_id: str,
     days: int,
@@ -157,15 +177,15 @@ def fetch_coin_history(
 ) -> pd.Series:
     cache_dir = cache_dir or Path("data_cache")
     cache_dir.mkdir(exist_ok=True)
-    cache_path = cache_dir / f"prices_{coin_id}_{days}_{cache_tag}.csv"
+    cache_path = cache_dir / f"coingecko_prices_{coin_id}_{days}_{cache_tag}.csv"
     if not refresh:
         cached = read_csv_if_exists(cache_path)
-        if cached is not None and _validate_cache_length(cached, days):
-            log(f"CACHE HIT: {cache_path}")
+        if cached is not None:
             series = cached.iloc[:, 0]
             series.name = coin_id
-            return series
-        if cached is not None:
+            if _validate_series(series, days):
+                log(f"CACHE HIT: {cache_path}")
+                return series
             log(f"CACHE INVALID: {cache_path} (refetching)")
 
     url = build_coingecko_url(f"/coins/{coin_id}/market_chart")
@@ -189,6 +209,89 @@ def fetch_coin_history(
     return series
 
 
+def fetch_coincap_top_assets(
+    limit: int,
+    cache_dir: Path,
+    refresh: bool,
+    cache_tag: str,
+) -> pd.DataFrame:
+    cache_path = cache_dir / f"coincap_top_assets_{limit}_{cache_tag}.csv"
+    if not refresh:
+        cached = read_csv_if_exists(cache_path)
+        if cached is not None and len(cached) >= int(limit * EXPECTED_COMPLETENESS_RATIO):
+            log(f"CACHE HIT: {cache_path}")
+            return cached
+        if cached is not None:
+            log(f"CACHE INVALID: {cache_path} (refetching)")
+
+    url = build_coincap_url("/assets")
+    params = {"limit": limit}
+    log(f"FETCH: CoinCap {url} -> {cache_path}")
+    try:
+        data = _request_json_with_retry(url, params=params)
+    except RequestException as exc:
+        raise SystemExit(
+            "CoinCap request failed. Check network connectivity or try again later."
+        ) from exc
+    assets = pd.DataFrame(data.get("data", []))
+    if assets.empty:
+        raise SystemExit("CoinCap returned no asset data.")
+    if "rank" in assets.columns:
+        assets["rank"] = pd.to_numeric(assets["rank"], errors="coerce")
+        assets = assets.sort_values("rank")
+    elif "marketCapUsd" in assets.columns:
+        assets["marketCapUsd"] = pd.to_numeric(assets["marketCapUsd"], errors="coerce")
+        assets = assets.sort_values("marketCapUsd", ascending=False)
+    assets = assets.head(limit)
+    atomic_to_csv(assets, cache_path)
+    return assets
+
+
+def fetch_coincap_history(
+    asset_id: str,
+    days: int,
+    cache_dir: Path,
+    refresh: bool,
+    cache_tag: str,
+) -> pd.Series:
+    cache_path = cache_dir / f"coincap_prices_{asset_id}_{days}_{cache_tag}.csv"
+    if not refresh:
+        cached = read_csv_if_exists(cache_path)
+        if cached is not None:
+            series = cached.iloc[:, 0]
+            series.name = asset_id
+            if _validate_series(series, days):
+                log(f"CACHE HIT: {cache_path}")
+                return series
+            log(f"CACHE INVALID: {cache_path} (refetching)")
+
+    url = build_coincap_url(f"/assets/{asset_id}/history")
+    end = pd.Timestamp.utcnow().normalize()
+    start = end - pd.Timedelta(days=days)
+    params = {
+        "interval": "d1",
+        "start": int(start.timestamp() * 1000),
+        "end": int(end.timestamp() * 1000),
+    }
+    log(f"FETCH: CoinCap {url} -> {cache_path}")
+    try:
+        data = _request_json_with_retry(url, params=params)
+    except RequestException as exc:
+        raise SystemExit(
+            "CoinCap request failed. Check network connectivity or try again later."
+        ) from exc
+    history = pd.DataFrame(data.get("data", []))
+    if history.empty:
+        raise SystemExit(f"CoinCap returned no history for {asset_id}.")
+    history["date"] = pd.to_datetime(history["date"]).dt.date
+    history["priceUsd"] = pd.to_numeric(history["priceUsd"], errors="coerce")
+    series = history.groupby("date")["priceUsd"].last()
+    series.index = pd.to_datetime(series.index)
+    series.name = asset_id
+    atomic_to_csv(series.to_frame(), cache_path)
+    return series
+
+
 def fetch_crypto_prices(
     coin_ids: list[str],
     days: int,
@@ -206,6 +309,97 @@ def fetch_crypto_prices(
         )
         series_list.append(series)
     prices = pd.concat(series_list, axis=1).sort_index()
+    return prices.ffill().dropna()
+
+
+def fetch_crypto_prices_with_fallback(
+    days: int,
+    cache_dir: Path,
+    refresh: bool,
+    cache_tag: str,
+    limit: int = 100,
+) -> pd.DataFrame:
+    coingecko_ids: list[str] = []
+    coingecko_prices: list[pd.Series] = []
+    use_coincap_ids: list[str] = []
+    try:
+        top_coins = fetch_top_coins(
+            limit, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+        )
+        coingecko_ids = top_coins["id"].tolist()
+    except (RequestException, SystemExit) as exc:
+        log(f"PROVIDER FAIL: CoinGecko {exc}; falling back to CoinCap")
+        coingecko_ids = []
+
+    if coingecko_ids:
+        total = len(coingecko_ids)
+        log(f"Starting crypto price fetch for {total} coins.")
+        for idx, coin_id in enumerate(coingecko_ids, start=1):
+            render_progress(idx, total, prefix="Coins ")
+            try:
+                series = fetch_coin_history(
+                    coin_id,
+                    days,
+                    cache_dir=cache_dir,
+                    refresh=refresh,
+                    cache_tag=cache_tag,
+                )
+                coingecko_prices.append(series)
+            except (RequestException, SystemExit) as exc:
+                log(f"PROVIDER FAIL: CoinGecko {exc}; falling back to CoinCap")
+                remaining = coingecko_ids[idx - 1 :]
+                use_coincap_ids.extend(remaining)
+                break
+
+    coincap_series: list[pd.Series] = []
+    if not coingecko_ids or use_coincap_ids:
+        try:
+            coincap_assets = fetch_coincap_top_assets(
+                limit, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+            )
+        except SystemExit as exc:
+            if coingecko_prices:
+                log(
+                    "PROVIDER FAIL: CoinCap unavailable; proceeding with CoinGecko data "
+                    f"({len(coingecko_prices)} assets)"
+                )
+                combined = coingecko_prices
+                prices = pd.concat(combined, axis=1).sort_index()
+                return prices.ffill().dropna()
+            raise SystemExit(
+                "Both CoinGecko and CoinCap are unavailable. "
+                "Ensure network access or cached data exists."
+            ) from exc
+        coincap_ids = coincap_assets["id"].tolist()
+        if use_coincap_ids:
+            coincap_ids = [
+                asset_id for asset_id in coincap_ids if asset_id in set(use_coincap_ids)
+            ]
+        log(f"Starting CoinCap price fetch for {len(coincap_ids)} assets.")
+        for idx, asset_id in enumerate(coincap_ids, start=1):
+            render_progress(idx, len(coincap_ids), prefix="CoinCap ")
+            try:
+                series = fetch_coincap_history(
+                    asset_id,
+                    days,
+                    cache_dir=cache_dir,
+                    refresh=refresh,
+                    cache_tag=cache_tag,
+                )
+                coincap_series.append(series)
+            except SystemExit as exc:
+                log(f"PROVIDER FAIL: CoinCap {exc}")
+                break
+        if use_coincap_ids:
+            log(
+                "MIXED PROVIDERS: filled "
+                f"{len(coincap_series)} assets from CoinCap due to CoinGecko failure"
+            )
+
+    combined = coingecko_prices + coincap_series
+    if not combined:
+        raise SystemExit("No crypto price data available from CoinGecko or CoinCap.")
+    prices = pd.concat(combined, axis=1).sort_index()
     return prices.ffill().dropna()
 
 
@@ -405,17 +599,13 @@ def main() -> None:
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(exist_ok=True)
     render_progress(1, 5, prefix="Setup ")
-    top_coins = fetch_top_coins(
-        100, cache_dir=cache_dir, refresh=args.refresh_cache, cache_tag=args.cache_tag
-    )
-    coin_ids = top_coins["id"].tolist()
     render_progress(2, 5, prefix="Setup ")
-    prices = fetch_crypto_prices(
-        coin_ids,
+    prices = fetch_crypto_prices_with_fallback(
         config.days,
         cache_dir=cache_dir,
         refresh=args.refresh_cache,
         cache_tag=args.cache_tag,
+        limit=100,
     )
     render_progress(3, 5, prefix="Setup ")
     benchmarks = fetch_benchmark_prices(
