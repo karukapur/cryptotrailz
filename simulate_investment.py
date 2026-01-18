@@ -66,23 +66,20 @@ def atomic_to_csv(df: pd.DataFrame, path: Path) -> None:
     tmp_path.replace(path)
 
 
-def _request_json(url: str, params: dict | None = None) -> dict:
-    api_key = os.getenv("COINGECKO_DEMO_API_KEY")
-    if not api_key:
-        raise SystemExit(
-            "COINGECKO_DEMO_API_KEY is required for CoinGecko fetches. "
-            "Set it in your environment before running with cache refresh."
-        )
-    headers = {"x-cg-demo-api-key": api_key}
+def _request_json(
+    url: str, params: dict | None = None, headers: dict | None = None
+) -> dict:
     response = requests.get(url, params=params, headers=headers, timeout=30)
     response.raise_for_status()
     return response.json()
 
 
-def _request_json_with_retry(url: str, params: dict | None = None) -> dict:
+def _request_json_with_retry(
+    url: str, params: dict | None = None, headers: dict | None = None
+) -> dict:
     for attempt in range(3):
         try:
-            return _request_json(url, params=params)
+            return _request_json(url, params=params, headers=headers)
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response else None
             if status in {429, 500, 502, 503, 504} and attempt < 2:
@@ -116,8 +113,15 @@ def fetch_top_coins(
         "page": 1,
         "sparkline": "false",
     }
+    api_key = os.getenv("COINGECKO_DEMO_API_KEY")
+    if not api_key:
+        raise SystemExit(
+            "COINGECKO_DEMO_API_KEY is required for CoinGecko fetches. "
+            "Set it in your environment before running with cache refresh."
+        )
+    headers = {"x-cg-demo-api-key": api_key}
     log(f"FETCH: {url} -> {cache_path}")
-    data = _request_json_with_retry(url, params=params)
+    data = _request_json_with_retry(url, params=params, headers=headers)
     df = pd.DataFrame(data)
     atomic_to_csv(df, cache_path)
     return df
@@ -149,8 +153,15 @@ def fetch_coin_history(
 
     url = f"{COINGECKO_API}/coins/{coin_id}/market_chart"
     params = {"vs_currency": "usd", "days": days, "interval": "daily"}
+    api_key = os.getenv("COINGECKO_DEMO_API_KEY")
+    if not api_key:
+        raise SystemExit(
+            "COINGECKO_DEMO_API_KEY is required for CoinGecko fetches. "
+            "Set it in your environment before running with cache refresh."
+        )
+    headers = {"x-cg-demo-api-key": api_key}
     log(f"FETCH: {url} -> {cache_path}")
-    data = _request_json_with_retry(url, params=params)
+    data = _request_json_with_retry(url, params=params, headers=headers)
     prices = pd.DataFrame(data["prices"], columns=["timestamp", "price"])
     prices["date"] = pd.to_datetime(prices["timestamp"], unit="ms").dt.date
     series = prices.groupby("date")["price"].last()
