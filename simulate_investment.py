@@ -8,6 +8,7 @@ and compares portfolio performance to Bitcoin, Nifty 50, and NASDAQ indices.
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,8 +27,8 @@ except ImportError as exc:  # pragma: no cover - handled at runtime
 import matplotlib.pyplot as plt
 
 COINGECKO_API = "https://api.coingecko.com/api/v3"
-CACHE_DIR = Path("data_cache")
-CACHE_DIR.mkdir(exist_ok=True)
+# Treat cached data with fewer than 80% of expected rows as invalid.
+EXPECTED_COMPLETENESS_RATIO = 0.8
 
 
 @dataclass
@@ -40,13 +41,60 @@ class SimulationConfig:
     amounts: tuple[int, ...] = (1000, 2000, 3000, 4000, 5000)
 
 
+def read_csv_if_exists(path: Path) -> pd.DataFrame | None:
+    if path.exists():
+        return pd.read_csv(path, index_col=0, parse_dates=True)
+    return None
+
+
+def atomic_to_csv(df: pd.DataFrame, path: Path) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    df.to_csv(tmp_path)
+    tmp_path.replace(path)
+
+
 def _request_json(url: str, params: dict | None = None) -> dict:
-    response = requests.get(url, params=params, timeout=30)
+    api_key = os.getenv("COINGECKO_DEMO_API_KEY")
+    if not api_key:
+        raise SystemExit(
+            "COINGECKO_DEMO_API_KEY is required for CoinGecko fetches. "
+            "Set it in your environment before running with cache refresh."
+        )
+    headers = {"x-cg-demo-api-key": api_key}
+    response = requests.get(url, params=params, headers=headers, timeout=30)
     response.raise_for_status()
     return response.json()
 
 
-def fetch_top_coins(limit: int = 100) -> pd.DataFrame:
+def _request_json_with_retry(url: str, params: dict | None = None) -> dict:
+    for attempt in range(3):
+        try:
+            return _request_json(url, params=params)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response else None
+            if status in {429, 500, 502, 503, 504} and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+
+def fetch_top_coins(
+    limit: int = 100,
+    cache_dir: Path | None = None,
+    refresh: bool = False,
+    cache_tag: str = "v1",
+) -> pd.DataFrame:
+    cache_dir = cache_dir or Path("data_cache")
+    cache_dir.mkdir(exist_ok=True)
+    cache_path = cache_dir / f"top_coins_{limit}_{cache_tag}.csv"
+    if not refresh:
+        cached = read_csv_if_exists(cache_path)
+        if cached is not None and len(cached) >= int(limit * EXPECTED_COMPLETENESS_RATIO):
+            print(f"CACHE HIT: {cache_path}")
+            return cached
+        if cached is not None:
+            print(f"CACHE INVALID: {cache_path} (refetching)")
+
     url = f"{COINGECKO_API}/coins/markets"
     params = {
         "vs_currency": "usd",
@@ -55,41 +103,89 @@ def fetch_top_coins(limit: int = 100) -> pd.DataFrame:
         "page": 1,
         "sparkline": "false",
     }
-    data = _request_json(url, params=params)
-    return pd.DataFrame(data)
+    print(f"FETCH: {url} -> {cache_path}")
+    data = _request_json_with_retry(url, params=params)
+    df = pd.DataFrame(data)
+    atomic_to_csv(df, cache_path)
+    return df
 
 
-def fetch_coin_history(coin_id: str, days: int) -> pd.Series:
-    cache_path = CACHE_DIR / f"{coin_id}_{days}.csv"
-    if cache_path.exists():
-        cached = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-        series = cached.iloc[:, 0]
-        series.name = coin_id
-        return series
+def _validate_cache_length(df: pd.DataFrame, expected_rows: int) -> bool:
+    return len(df) >= int(expected_rows * EXPECTED_COMPLETENESS_RATIO)
+
+
+def fetch_coin_history(
+    coin_id: str,
+    days: int,
+    cache_dir: Path | None = None,
+    refresh: bool = False,
+    cache_tag: str = "v1",
+) -> pd.Series:
+    cache_dir = cache_dir or Path("data_cache")
+    cache_dir.mkdir(exist_ok=True)
+    cache_path = cache_dir / f"prices_{coin_id}_{days}_{cache_tag}.csv"
+    if not refresh:
+        cached = read_csv_if_exists(cache_path)
+        if cached is not None and _validate_cache_length(cached, days):
+            print(f"CACHE HIT: {cache_path}")
+            series = cached.iloc[:, 0]
+            series.name = coin_id
+            return series
+        if cached is not None:
+            print(f"CACHE INVALID: {cache_path} (refetching)")
 
     url = f"{COINGECKO_API}/coins/{coin_id}/market_chart"
     params = {"vs_currency": "usd", "days": days, "interval": "daily"}
-    data = _request_json(url, params=params)
+    print(f"FETCH: {url} -> {cache_path}")
+    data = _request_json_with_retry(url, params=params)
     prices = pd.DataFrame(data["prices"], columns=["timestamp", "price"])
     prices["date"] = pd.to_datetime(prices["timestamp"], unit="ms").dt.date
     series = prices.groupby("date")["price"].last()
     series.index = pd.to_datetime(series.index)
     series.name = coin_id
-    series.to_csv(cache_path)
+    atomic_to_csv(series.to_frame(), cache_path)
     time.sleep(1.2)
     return series
 
 
-def fetch_crypto_prices(coin_ids: list[str], days: int) -> pd.DataFrame:
-    series_list = [fetch_coin_history(coin_id, days) for coin_id in coin_ids]
+def fetch_crypto_prices(
+    coin_ids: list[str],
+    days: int,
+    cache_dir: Path,
+    refresh: bool,
+    cache_tag: str,
+) -> pd.DataFrame:
+    series_list = [
+        fetch_coin_history(
+            coin_id, days, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+        )
+        for coin_id in coin_ids
+    ]
     prices = pd.concat(series_list, axis=1).sort_index()
     return prices.ffill().dropna()
 
 
-def fetch_benchmark_prices(days: int) -> pd.DataFrame:
+def fetch_benchmark_prices(
+    days: int,
+    cache_dir: Path | None = None,
+    refresh: bool = False,
+    cache_tag: str = "v1",
+) -> pd.DataFrame:
+    cache_dir = cache_dir or Path("data_cache")
+    cache_dir.mkdir(exist_ok=True)
+    cache_path = cache_dir / f"benchmarks_{days}_{cache_tag}.csv"
+    if not refresh:
+        cached = read_csv_if_exists(cache_path)
+        if cached is not None and _validate_cache_length(cached, days):
+            print(f"CACHE HIT: {cache_path}")
+            return cached
+        if cached is not None:
+            print(f"CACHE INVALID: {cache_path} (refetching)")
+
     end = pd.Timestamp.utcnow().normalize()
     start = end - pd.Timedelta(days=days)
     tickers = {"Bitcoin": "BTC-USD", "Nifty50": "^NSEI", "NASDAQ": "^IXIC"}
+    print(f"FETCH: yfinance benchmarks -> {cache_path}")
     data = yf.download(
         list(tickers.values()),
         start=start.strftime("%Y-%m-%d"),
@@ -97,7 +193,9 @@ def fetch_benchmark_prices(days: int) -> pd.DataFrame:
         progress=False,
     )["Adj Close"]
     data = data.rename(columns={v: k for k, v in tickers.items()})
-    return data.ffill().dropna()
+    data = data.ffill().dropna()
+    atomic_to_csv(data, cache_path)
+    return data
 
 
 def _get_rebalance_dates(index: pd.DatetimeIndex, interval: str) -> pd.DatetimeIndex:
@@ -241,6 +339,9 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=[1000, 2000, 3000, 4000, 5000],
     )
+    parser.add_argument("--cache-dir", type=str, default="data_cache")
+    parser.add_argument("--refresh-cache", action="store_true")
+    parser.add_argument("--cache-tag", type=str, default="v1")
     return parser.parse_args()
 
 
@@ -255,10 +356,25 @@ def main() -> None:
         amounts=tuple(args.amounts),
     )
 
-    top_coins = fetch_top_coins(100)
+    cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(exist_ok=True)
+    top_coins = fetch_top_coins(
+        100, cache_dir=cache_dir, refresh=args.refresh_cache, cache_tag=args.cache_tag
+    )
     coin_ids = top_coins["id"].tolist()
-    prices = fetch_crypto_prices(coin_ids, config.days)
-    benchmarks = fetch_benchmark_prices(config.days)
+    prices = fetch_crypto_prices(
+        coin_ids,
+        config.days,
+        cache_dir=cache_dir,
+        refresh=args.refresh_cache,
+        cache_tag=args.cache_tag,
+    )
+    benchmarks = fetch_benchmark_prices(
+        config.days,
+        cache_dir=cache_dir,
+        refresh=args.refresh_cache,
+        cache_tag=args.cache_tag,
+    )
     benchmarks = benchmarks.reindex(prices.index).ffill().dropna()
 
     weightings = (
