@@ -31,6 +31,19 @@ COINGECKO_API = "https://api.coingecko.com/api/v3"
 EXPECTED_COMPLETENESS_RATIO = 0.8
 
 
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def render_progress(current: int, total: int, prefix: str = "") -> None:
+    width = 30
+    ratio = min(max(current / total, 0), 1)
+    filled = int(width * ratio)
+    bar = "█" * filled + "-" * (width - filled)
+    percent = ratio * 100
+    log(f"{prefix}[{bar}] {current}/{total} ({percent:5.1f}%)")
+
+
 @dataclass
 class SimulationConfig:
     days: int = 444
@@ -90,10 +103,10 @@ def fetch_top_coins(
     if not refresh:
         cached = read_csv_if_exists(cache_path)
         if cached is not None and len(cached) >= int(limit * EXPECTED_COMPLETENESS_RATIO):
-            print(f"CACHE HIT: {cache_path}")
+            log(f"CACHE HIT: {cache_path}")
             return cached
         if cached is not None:
-            print(f"CACHE INVALID: {cache_path} (refetching)")
+            log(f"CACHE INVALID: {cache_path} (refetching)")
 
     url = f"{COINGECKO_API}/coins/markets"
     params = {
@@ -103,7 +116,7 @@ def fetch_top_coins(
         "page": 1,
         "sparkline": "false",
     }
-    print(f"FETCH: {url} -> {cache_path}")
+    log(f"FETCH: {url} -> {cache_path}")
     data = _request_json_with_retry(url, params=params)
     df = pd.DataFrame(data)
     atomic_to_csv(df, cache_path)
@@ -127,16 +140,16 @@ def fetch_coin_history(
     if not refresh:
         cached = read_csv_if_exists(cache_path)
         if cached is not None and _validate_cache_length(cached, days):
-            print(f"CACHE HIT: {cache_path}")
+            log(f"CACHE HIT: {cache_path}")
             series = cached.iloc[:, 0]
             series.name = coin_id
             return series
         if cached is not None:
-            print(f"CACHE INVALID: {cache_path} (refetching)")
+            log(f"CACHE INVALID: {cache_path} (refetching)")
 
     url = f"{COINGECKO_API}/coins/{coin_id}/market_chart"
     params = {"vs_currency": "usd", "days": days, "interval": "daily"}
-    print(f"FETCH: {url} -> {cache_path}")
+    log(f"FETCH: {url} -> {cache_path}")
     data = _request_json_with_retry(url, params=params)
     prices = pd.DataFrame(data["prices"], columns=["timestamp", "price"])
     prices["date"] = pd.to_datetime(prices["timestamp"], unit="ms").dt.date
@@ -155,12 +168,15 @@ def fetch_crypto_prices(
     refresh: bool,
     cache_tag: str,
 ) -> pd.DataFrame:
-    series_list = [
-        fetch_coin_history(
+    series_list = []
+    total = len(coin_ids)
+    log(f"Starting crypto price fetch for {total} coins.")
+    for idx, coin_id in enumerate(coin_ids, start=1):
+        render_progress(idx, total, prefix="Coins ")
+        series = fetch_coin_history(
             coin_id, days, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
         )
-        for coin_id in coin_ids
-    ]
+        series_list.append(series)
     prices = pd.concat(series_list, axis=1).sort_index()
     return prices.ffill().dropna()
 
@@ -177,15 +193,15 @@ def fetch_benchmark_prices(
     if not refresh:
         cached = read_csv_if_exists(cache_path)
         if cached is not None and _validate_cache_length(cached, days):
-            print(f"CACHE HIT: {cache_path}")
+            log(f"CACHE HIT: {cache_path}")
             return cached
         if cached is not None:
-            print(f"CACHE INVALID: {cache_path} (refetching)")
+            log(f"CACHE INVALID: {cache_path} (refetching)")
 
     end = pd.Timestamp.utcnow().normalize()
     start = end - pd.Timedelta(days=days)
     tickers = {"Bitcoin": "BTC-USD", "Nifty50": "^NSEI", "NASDAQ": "^IXIC"}
-    print(f"FETCH: yfinance benchmarks -> {cache_path}")
+    log(f"FETCH: yfinance benchmarks -> {cache_path}")
     data = yf.download(
         list(tickers.values()),
         start=start.strftime("%Y-%m-%d"),
@@ -347,6 +363,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    log("Starting simulation.")
+    render_progress(0, 5, prefix="Setup ")
     config = SimulationConfig(
         days=args.days,
         rebalance=args.rebalance,
@@ -358,10 +376,12 @@ def main() -> None:
 
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(exist_ok=True)
+    render_progress(1, 5, prefix="Setup ")
     top_coins = fetch_top_coins(
         100, cache_dir=cache_dir, refresh=args.refresh_cache, cache_tag=args.cache_tag
     )
     coin_ids = top_coins["id"].tolist()
+    render_progress(2, 5, prefix="Setup ")
     prices = fetch_crypto_prices(
         coin_ids,
         config.days,
@@ -369,6 +389,7 @@ def main() -> None:
         refresh=args.refresh_cache,
         cache_tag=args.cache_tag,
     )
+    render_progress(3, 5, prefix="Setup ")
     benchmarks = fetch_benchmark_prices(
         config.days,
         cache_dir=cache_dir,
@@ -376,6 +397,7 @@ def main() -> None:
         cache_tag=args.cache_tag,
     )
     benchmarks = benchmarks.reindex(prices.index).ffill().dropna()
+    render_progress(4, 5, prefix="Setup ")
 
     weightings = (
         ["equal", "volatility", "momentum"] if args.weighting == "all" else [args.weighting]
@@ -383,15 +405,20 @@ def main() -> None:
 
     results: dict[str, dict[int, pd.Series]] = {}
     for weighting in weightings:
+        log(f"Running simulations for weighting={weighting}.")
         config.weighting = weighting
         results[weighting] = {}
         for amount in config.amounts:
+            log(f"Simulating amount {amount} NTD.")
             results[weighting][amount] = simulate_portfolio(prices, amount, config)
 
     summary = summarize_results(results, config.amounts)
     summary.to_csv("performance_summary.csv", index=False)
-    print(summary)
+    log("Simulation summary:")
+    log(summary.to_string(index=False))
     plot_results(results, benchmarks, config.amounts)
+    render_progress(5, 5, prefix="Setup ")
+    log("Finished. Outputs: performance_summary.csv and portfolio_*.png files.")
 
 
 if __name__ == "__main__":
