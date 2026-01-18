@@ -12,6 +12,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import numpy as np
 import pandas as pd
@@ -42,6 +43,17 @@ def render_progress(current: int, total: int, prefix: str = "") -> None:
     bar = "█" * filled + "-" * (width - filled)
     percent = ratio * 100
     log(f"{prefix}[{bar}] {current}/{total} ({percent:5.1f}%)")
+
+
+def build_coingecko_url(path: str) -> str:
+    parts = urlsplit(COINGECKO_API)
+    if parts.query or parts.fragment:
+        raise SystemExit(
+            "COINGECKO_API must be a base URL without query parameters or fragments. "
+            "Ensure it is set to https://api.coingecko.com/api/v3."
+        )
+    base = urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/") + "/", "", ""))
+    return urljoin(base, path.lstrip("/"))
 
 
 @dataclass
@@ -105,7 +117,7 @@ def fetch_top_coins(
         if cached is not None:
             log(f"CACHE INVALID: {cache_path} (refetching)")
 
-    url = f"{COINGECKO_API}/coins/markets"
+    url = build_coingecko_url("/coins/markets")
     params = {
         "vs_currency": "usd",
         "order": "market_cap_desc",
@@ -123,6 +135,11 @@ def fetch_top_coins(
     log(f"FETCH: {url} -> {cache_path}")
     data = _request_json_with_retry(url, params=params, headers=headers)
     df = pd.DataFrame(data)
+    if "id" not in df.columns:
+        raise SystemExit(
+            "Unexpected CoinGecko response: missing 'id' column. "
+            "Check COINGECKO_API and API key configuration."
+        )
     atomic_to_csv(df, cache_path)
     return df
 
@@ -151,7 +168,7 @@ def fetch_coin_history(
         if cached is not None:
             log(f"CACHE INVALID: {cache_path} (refetching)")
 
-    url = f"{COINGECKO_API}/coins/{coin_id}/market_chart"
+    url = build_coingecko_url(f"/coins/{coin_id}/market_chart")
     params = {"vs_currency": "usd", "days": days, "interval": "daily"}
     api_key = os.getenv("COINGECKO_DEMO_API_KEY")
     if not api_key:
