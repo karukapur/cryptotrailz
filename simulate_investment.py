@@ -285,6 +285,39 @@ def fetch_cryptocompare_history(
     return series
 
 
+def fetch_cryptocompare_coinlist(
+    cache_dir: Path | None = None,
+    refresh: bool = False,
+    cache_tag: str = "v1",
+) -> set[str]:
+    cache_dir = cache_dir or Path("data_cache")
+    cache_dir.mkdir(exist_ok=True)
+    cache_path = cache_dir / f"cryptocompare_coinlist_{cache_tag}.csv"
+    if not refresh:
+        cached = read_csv_if_exists(cache_path)
+        if cached is not None and not cached.empty:
+            symbols = set(cached["symbol"].dropna().str.upper())
+            if symbols:
+                log(f"CACHE HIT: {cache_path}")
+                return symbols
+            log(f"CACHE INVALID: {cache_path} (refetching)")
+
+    url = build_cryptocompare_url("/all/coinlist")
+    headers = {}
+    api_key = os.getenv("CRYPTOCOMPARE_API_KEY")
+    if api_key:
+        headers["authorization"] = f"Apikey {api_key}"
+    log(f"FETCH: CryptoCompare {url} -> {cache_path}")
+    data = _request_json_with_retry_cryptocompare(url, headers=headers)
+    coin_data = pd.DataFrame.from_dict(data.get("Data", {}), orient="index")
+    if coin_data.empty or "Symbol" not in coin_data.columns:
+        raise SystemExit("CryptoCompare coin list is unavailable.")
+    coin_data = coin_data.rename(columns={"Symbol": "symbol"})
+    coin_data["symbol"] = coin_data["symbol"].astype(str).str.upper()
+    atomic_to_csv(coin_data[["symbol"]], cache_path)
+    return set(coin_data["symbol"])
+
+
 def fetch_hybrid_history(
     coin_id: str,
     symbol: str,
@@ -522,6 +555,7 @@ def fetch_crypto_prices(
         for coin_id, symbol in zip(top_coins["id"], top_coins["symbol"], strict=False)
         if isinstance(symbol, str) and symbol
     ]
+    cryptocompare_symbols: set[str] | None = None
     if provider == "coingecko":
         if days > 365:
             raise SystemExit(
@@ -533,8 +567,16 @@ def fetch_crypto_prices(
             coin_ids, days, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
         )
     if provider == "cryptocompare":
+        cryptocompare_symbols = fetch_cryptocompare_coinlist(
+            cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+        )
+        filtered_assets = [
+            asset
+            for asset in assets
+            if asset["symbol"].upper() in cryptocompare_symbols
+        ]
         return fetch_cryptocompare_prices(
-            assets,
+            filtered_assets,
             days,
             cache_dir=cache_dir,
             refresh=refresh,
@@ -547,8 +589,16 @@ def fetch_crypto_prices(
             return fetch_coingecko_prices(
                 coin_ids, days, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
             )
+        cryptocompare_symbols = fetch_cryptocompare_coinlist(
+            cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+        )
+        filtered_assets = [
+            asset
+            for asset in assets
+            if asset["symbol"].upper() in cryptocompare_symbols
+        ]
         return fetch_hybrid_prices(
-            assets, days, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+            filtered_assets, days, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
         )
     raise ValueError(f"Unknown provider: {provider}")
 
