@@ -30,8 +30,10 @@ import matplotlib.pyplot as plt
 
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 COINCAP_API = "https://api.coincap.io/v2"
+CRYPTOCOMPARE_API = "https://min-api.cryptocompare.com/data/v2"
 # Treat cached data with fewer than 80% of expected rows as invalid.
 EXPECTED_COMPLETENESS_RATIO = 0.8
+MIN_REQUIRED_ASSETS = 80
 
 
 def log(message: str) -> None:
@@ -60,6 +62,11 @@ def build_coingecko_url(path: str) -> str:
 
 def build_coincap_url(path: str) -> str:
     base = COINCAP_API.rstrip("/") + "/"
+    return urljoin(base, path.lstrip("/"))
+
+
+def build_cryptocompare_url(path: str) -> str:
+    base = CRYPTOCOMPARE_API.rstrip("/") + "/"
     return urljoin(base, path.lstrip("/"))
 
 
@@ -105,6 +112,25 @@ def _request_json_with_retry(
                 raise SystemExit(
                     "CoinGecko API request returned 401 Unauthorized. "
                     "Verify COINGECKO_DEMO_API_KEY is set and valid."
+                ) from exc
+            if status in {429, 500, 502, 503, 504} and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+
+def _request_json_with_retry_cryptocompare(
+    url: str, params: dict | None = None, headers: dict | None = None
+) -> dict:
+    for attempt in range(3):
+        try:
+            return _request_json(url, params=params, headers=headers)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response else None
+            if status == 401:
+                raise SystemExit(
+                    "CryptoCompare API request returned 401 Unauthorized. "
+                    "Verify CRYPTOCOMPARE_API_KEY is set and valid."
                 ) from exc
             if status in {429, 500, 502, 503, 504} and attempt < 2:
                 time.sleep(2 ** attempt)
@@ -209,6 +235,103 @@ def fetch_coin_history(
     return series
 
 
+def fetch_cryptocompare_history(
+    symbol: str,
+    days_needed: int,
+    cache_dir: Path | None = None,
+    refresh: bool = False,
+    cache_tag: str = "v1",
+    end_ts: int | None = None,
+) -> pd.Series:
+    if days_needed <= 0:
+        raise ValueError("days_needed must be a positive integer.")
+    cache_dir = cache_dir or Path("data_cache")
+    cache_dir.mkdir(exist_ok=True)
+    cache_path = cache_dir / f"cryptocompare_prices_{symbol}_{days_needed}_{cache_tag}.csv"
+    if not refresh:
+        cached = read_csv_if_exists(cache_path)
+        if cached is not None:
+            series = cached.iloc[:, 0]
+            series.name = symbol
+            if _validate_series(series, days_needed):
+                log(f"CACHE HIT: {cache_path}")
+                return series
+            log(f"CACHE INVALID: {cache_path} (refetching)")
+
+    url = build_cryptocompare_url("/histoday")
+    params = {
+        "fsym": symbol.upper(),
+        "tsym": "USD",
+        "limit": max(days_needed - 1, 0),
+    }
+    if end_ts is None:
+        end_ts = int(pd.Timestamp.utcnow().normalize().timestamp())
+    params["toTs"] = int(end_ts)
+    headers = {}
+    api_key = os.getenv("CRYPTOCOMPARE_API_KEY")
+    if api_key:
+        headers["authorization"] = f"Apikey {api_key}"
+    log(f"FETCH: CryptoCompare {url} -> {cache_path}")
+    data = _request_json_with_retry_cryptocompare(url, params=params, headers=headers)
+    history = pd.DataFrame(data.get("Data", {}).get("Data", []))
+    if history.empty:
+        raise SystemExit(f"CryptoCompare returned no history for {symbol}.")
+    history["date"] = pd.to_datetime(history["time"], unit="s").dt.date
+    history["close"] = pd.to_numeric(history["close"], errors="coerce")
+    series = history.groupby("date")["close"].last()
+    series.index = pd.to_datetime(series.index)
+    series.name = symbol
+    atomic_to_csv(series.to_frame(), cache_path)
+    return series
+
+
+def fetch_hybrid_history(
+    coin_id: str,
+    symbol: str,
+    days: int,
+    cache_dir: Path,
+    refresh: bool,
+    cache_tag: str,
+) -> pd.Series:
+    if days <= 365:
+        return fetch_coin_history(
+            coin_id, days, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+        )
+    cache_path = cache_dir / f"stitched_prices_{coin_id}_{days}_{cache_tag}.csv"
+    if not refresh:
+        cached = read_csv_if_exists(cache_path)
+        if cached is not None:
+            series = cached.iloc[:, 0]
+            series.name = coin_id
+            if _validate_series(series, days):
+                log(f"CACHE HIT: {cache_path}")
+                return series
+            log(f"CACHE INVALID: {cache_path} (refetching)")
+
+    recent_series = fetch_coin_history(
+        coin_id, 365, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+    )
+    cutoff_date = recent_series.index.min()
+    older_days = days - 365
+    end_ts = int((cutoff_date - pd.Timedelta(days=1)).timestamp())
+    older_series = fetch_cryptocompare_history(
+        symbol,
+        older_days,
+        cache_dir=cache_dir,
+        refresh=refresh,
+        cache_tag=cache_tag,
+        end_ts=end_ts,
+    )
+    older_series.name = coin_id
+    combined = pd.concat([older_series, recent_series], axis=0)
+    combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    combined.name = coin_id
+    if not _validate_series(combined, days):
+        raise ValueError(f"Hybrid series for {coin_id} is incomplete.")
+    atomic_to_csv(combined.to_frame(), cache_path)
+    return combined
+
+
 def fetch_coincap_top_assets(
     limit: int,
     cache_dir: Path,
@@ -292,7 +415,7 @@ def fetch_coincap_history(
     return series
 
 
-def fetch_crypto_prices(
+def fetch_coingecko_prices(
     coin_ids: list[str],
     days: int,
     cache_dir: Path,
@@ -301,7 +424,7 @@ def fetch_crypto_prices(
 ) -> pd.DataFrame:
     series_list = []
     total = len(coin_ids)
-    log(f"Starting crypto price fetch for {total} coins.")
+    log(f"Starting CoinGecko price fetch for {total} coins.")
     for idx, coin_id in enumerate(coin_ids, start=1):
         render_progress(idx, total, prefix="Coins ")
         series = fetch_coin_history(
@@ -312,95 +435,122 @@ def fetch_crypto_prices(
     return prices.ffill().dropna()
 
 
-def fetch_crypto_prices_with_fallback(
+def fetch_cryptocompare_prices(
+    assets: list[dict[str, str]],
     days: int,
     cache_dir: Path,
     refresh: bool,
     cache_tag: str,
-    limit: int = 100,
+    provider_label: str,
 ) -> pd.DataFrame:
-    coingecko_ids: list[str] = []
-    coingecko_prices: list[pd.Series] = []
-    use_coincap_ids: list[str] = []
-    try:
-        top_coins = fetch_top_coins(
-            limit, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
-        )
-        coingecko_ids = top_coins["id"].tolist()
-    except (RequestException, SystemExit) as exc:
-        log(f"PROVIDER FAIL: CoinGecko {exc}; falling back to CoinCap")
-        coingecko_ids = []
-
-    if coingecko_ids:
-        total = len(coingecko_ids)
-        log(f"Starting crypto price fetch for {total} coins.")
-        for idx, coin_id in enumerate(coingecko_ids, start=1):
-            render_progress(idx, total, prefix="Coins ")
-            try:
-                series = fetch_coin_history(
-                    coin_id,
-                    days,
-                    cache_dir=cache_dir,
-                    refresh=refresh,
-                    cache_tag=cache_tag,
-                )
-                coingecko_prices.append(series)
-            except (RequestException, SystemExit) as exc:
-                log(f"PROVIDER FAIL: CoinGecko {exc}; falling back to CoinCap")
-                remaining = coingecko_ids[idx - 1 :]
-                use_coincap_ids.extend(remaining)
-                break
-
-    coincap_series: list[pd.Series] = []
-    if not coingecko_ids or use_coincap_ids:
+    series_list: list[pd.Series] = []
+    total = len(assets)
+    log(f"Starting {provider_label} price fetch for {total} assets.")
+    for idx, asset in enumerate(assets, start=1):
+        render_progress(idx, total, prefix="Coins ")
         try:
-            coincap_assets = fetch_coincap_top_assets(
-                limit, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+            series = fetch_cryptocompare_history(
+                asset["symbol"],
+                days,
+                cache_dir=cache_dir,
+                refresh=refresh,
+                cache_tag=cache_tag,
             )
-        except SystemExit as exc:
-            if coingecko_prices:
-                log(
-                    "PROVIDER FAIL: CoinCap unavailable; proceeding with CoinGecko data "
-                    f"({len(coingecko_prices)} assets)"
-                )
-                combined = coingecko_prices
-                prices = pd.concat(combined, axis=1).sort_index()
-                return prices.ffill().dropna()
-            raise SystemExit(
-                "Both CoinGecko and CoinCap are unavailable. "
-                "Ensure network access or cached data exists."
-            ) from exc
-        coincap_ids = coincap_assets["id"].tolist()
-        if use_coincap_ids:
-            coincap_ids = [
-                asset_id for asset_id in coincap_ids if asset_id in set(use_coincap_ids)
-            ]
-        log(f"Starting CoinCap price fetch for {len(coincap_ids)} assets.")
-        for idx, asset_id in enumerate(coincap_ids, start=1):
-            render_progress(idx, len(coincap_ids), prefix="CoinCap ")
-            try:
-                series = fetch_coincap_history(
-                    asset_id,
-                    days,
-                    cache_dir=cache_dir,
-                    refresh=refresh,
-                    cache_tag=cache_tag,
-                )
-                coincap_series.append(series)
-            except SystemExit as exc:
-                log(f"PROVIDER FAIL: CoinCap {exc}")
-                break
-        if use_coincap_ids:
-            log(
-                "MIXED PROVIDERS: filled "
-                f"{len(coincap_series)} assets from CoinCap due to CoinGecko failure"
-            )
-
-    combined = coingecko_prices + coincap_series
-    if not combined:
-        raise SystemExit("No crypto price data available from CoinGecko or CoinCap.")
-    prices = pd.concat(combined, axis=1).sort_index()
+            series.name = asset["id"]
+            series_list.append(series)
+        except (RequestException, SystemExit, ValueError) as exc:
+            log(f"PROVIDER FAIL: CryptoCompare {asset['symbol']} {exc}")
+            continue
+    if len(series_list) < MIN_REQUIRED_ASSETS:
+        raise SystemExit(
+            "CryptoCompare returned too few assets to build a portfolio. "
+            "Set CRYPTOCOMPARE_API_KEY or reduce the universe size."
+        )
+    prices = pd.concat(series_list, axis=1).sort_index()
     return prices.ffill().dropna()
+
+
+def fetch_hybrid_prices(
+    assets: list[dict[str, str]],
+    days: int,
+    cache_dir: Path,
+    refresh: bool,
+    cache_tag: str,
+) -> pd.DataFrame:
+    series_list: list[pd.Series] = []
+    total = len(assets)
+    log(f"Starting hybrid price fetch for {total} assets.")
+    for idx, asset in enumerate(assets, start=1):
+        render_progress(idx, total, prefix="Coins ")
+        try:
+            series = fetch_hybrid_history(
+                asset["id"],
+                asset["symbol"],
+                days,
+                cache_dir=cache_dir,
+                refresh=refresh,
+                cache_tag=cache_tag,
+            )
+            series_list.append(series)
+        except (RequestException, SystemExit, ValueError) as exc:
+            log(f"PROVIDER FAIL: Hybrid {asset['symbol']} {exc}")
+            continue
+    if len(series_list) < MIN_REQUIRED_ASSETS:
+        raise SystemExit(
+            "Hybrid history returned too few assets to build a portfolio. "
+            "Set CRYPTOCOMPARE_API_KEY or reduce the universe size."
+        )
+    prices = pd.concat(series_list, axis=1).sort_index()
+    return prices.ffill().dropna()
+
+
+def fetch_crypto_prices(
+    days: int,
+    cache_dir: Path,
+    refresh: bool,
+    cache_tag: str,
+    limit: int,
+    provider: str,
+) -> pd.DataFrame:
+    top_coins = fetch_top_coins(
+        limit, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+    )
+    if "id" not in top_coins.columns or "symbol" not in top_coins.columns:
+        raise SystemExit("CoinGecko top coins data is missing required fields.")
+    assets = [
+        {"id": coin_id, "symbol": symbol}
+        for coin_id, symbol in zip(top_coins["id"], top_coins["symbol"], strict=False)
+        if isinstance(symbol, str) and symbol
+    ]
+    if provider == "coingecko":
+        if days > 365:
+            raise SystemExit(
+                "CoinGecko demo/public plans only support 365 days of history. "
+                "Use --provider hybrid or reduce --days."
+            )
+        coin_ids = [asset["id"] for asset in assets]
+        return fetch_coingecko_prices(
+            coin_ids, days, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+        )
+    if provider == "cryptocompare":
+        return fetch_cryptocompare_prices(
+            assets,
+            days,
+            cache_dir=cache_dir,
+            refresh=refresh,
+            cache_tag=cache_tag,
+            provider_label="CryptoCompare",
+        )
+    if provider == "hybrid":
+        if days <= 365:
+            coin_ids = [asset["id"] for asset in assets]
+            return fetch_coingecko_prices(
+                coin_ids, days, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+            )
+        return fetch_hybrid_prices(
+            assets, days, cache_dir=cache_dir, refresh=refresh, cache_tag=cache_tag
+        )
+    raise ValueError(f"Unknown provider: {provider}")
 
 
 def fetch_benchmark_prices(
@@ -580,6 +730,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", type=str, default="data_cache")
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--cache-tag", type=str, default="v1")
+    parser.add_argument(
+        "--provider",
+        choices=["coingecko", "cryptocompare", "hybrid"],
+        default="hybrid",
+    )
     return parser.parse_args()
 
 
@@ -600,12 +755,13 @@ def main() -> None:
     cache_dir.mkdir(exist_ok=True)
     render_progress(1, 5, prefix="Setup ")
     render_progress(2, 5, prefix="Setup ")
-    prices = fetch_crypto_prices_with_fallback(
+    prices = fetch_crypto_prices(
         config.days,
         cache_dir=cache_dir,
         refresh=args.refresh_cache,
         cache_tag=args.cache_tag,
         limit=100,
+        provider=args.provider,
     )
     render_progress(3, 5, prefix="Setup ")
     benchmarks = fetch_benchmark_prices(
