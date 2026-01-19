@@ -493,12 +493,27 @@ def fetch_benchmark_prices(
     start = end - pd.Timedelta(days=days)
     tickers = {"Bitcoin": "BTC-USD", "Nifty50": "^NSEI", "NASDAQ": "^IXIC"}
     log(f"FETCH: yfinance benchmarks -> {cache_path}")
-    data = yf.download(
+    downloaded = yf.download(
         list(tickers.values()),
         start=start.strftime("%Y-%m-%d"),
         end=end.strftime("%Y-%m-%d"),
         progress=False,
-    )["Adj Close"]
+    )
+    if isinstance(downloaded.columns, pd.MultiIndex):
+        if "Adj Close" in downloaded.columns.get_level_values(0):
+            data = downloaded["Adj Close"]
+        elif "Close" in downloaded.columns.get_level_values(0):
+            data = downloaded["Close"]
+        else:
+            raise SystemExit("yfinance response missing Adj Close/Close data.")
+    else:
+        if "Adj Close" in downloaded.columns:
+            data = downloaded["Adj Close"]
+        elif "Close" in downloaded.columns:
+            data = downloaded["Close"]
+        else:
+            raise SystemExit("yfinance response missing Adj Close/Close data.")
+
     data = data.rename(columns={v: k for k, v in tickers.items()})
     data = data.ffill().dropna()
     atomic_to_csv(data, cache_path)
