@@ -81,6 +81,18 @@ class SimulationConfig:
     amounts: tuple[int, ...] = (1000, 2000, 3000, 4000, 5000)
 
 
+@dataclass(frozen=True)
+class UniverseSettings:
+    exchange: str
+    quote: str
+    top_n: int
+    days: int
+    cache_tag: str
+    exclude_stable_bases: bool
+    exclude_leveraged: bool
+    min_quote_volume: float
+
+
 def read_csv_if_exists(path: Path) -> pd.DataFrame | None:
     if path.exists():
         return pd.read_csv(path, index_col=0, parse_dates=[0])
@@ -361,6 +373,104 @@ def build_ccxt_prices(
     prices = prices.ffill().dropna()
     return prices
 
+    log(f"Cache hits: {cache_hits}, Fetches: {fetches}, Skipped: {skipped}.")
+
+def _unique_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            output.append(item)
+    return output
+
+
+def _build_candidate_settings(args: argparse.Namespace) -> list[UniverseSettings]:
+    exchanges = _unique_preserve_order(
+        [args.exchange, "binance", "kraken", "coinbase", "bitstamp"]
+    )
+    quotes = _unique_preserve_order([args.quote, "USDT", "USD", "USDC"])
+    top_ns = [args.top_n, max(args.top_n - 20, 60), max(args.top_n - 40, 40), 30]
+    days_list = [args.days, max(int(args.days * 0.85), 365), max(int(args.days * 0.7), 250)]
+
+    candidates: list[UniverseSettings] = []
+    for exchange in exchanges:
+        for quote in quotes:
+            for days in days_list:
+                for top_n in top_ns:
+                    candidates.append(
+                        UniverseSettings(
+                            exchange=exchange,
+                            quote=quote,
+                            top_n=top_n,
+                            days=days,
+                            cache_tag=args.cache_tag,
+                            exclude_stable_bases=args.exclude_stable_bases,
+                            exclude_leveraged=args.exclude_leveraged,
+                            min_quote_volume=args.min_quote_volume,
+                        )
+                    )
+    return candidates
+
+
+def _attempt_universe_build(
+    settings: UniverseSettings,
+    cache_dir: Path,
+    refresh: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    log(
+        "Attempting settings: "
+        f"exchange={settings.exchange}, quote={settings.quote}, "
+        f"top_n={settings.top_n}, days={settings.days}"
+    )
+    universe = build_ccxt_universe(
+        exchange_id=settings.exchange,
+        quote=settings.quote,
+        top_n=settings.top_n,
+        cache_dir=cache_dir,
+        refresh=refresh,
+        cache_tag=settings.cache_tag,
+        exclude_stable_bases=settings.exclude_stable_bases,
+        exclude_leveraged=settings.exclude_leveraged,
+        min_quote_volume=settings.min_quote_volume,
+    )
+    universe.attrs["exchange_id"] = settings.exchange
+    universe.attrs["cache_tag"] = settings.cache_tag
+
+    prices = build_ccxt_prices(
+        universe,
+        days=settings.days,
+        cache_dir=cache_dir,
+        refresh=refresh,
+    )
+    return universe, prices
+
+
+def _recursive_autotune(
+    candidates: list[UniverseSettings],
+    cache_dir: Path,
+    refresh: bool,
+    index: int = 0,
+) -> tuple[UniverseSettings, pd.DataFrame, pd.DataFrame]:
+    if index >= len(candidates):
+        raise SystemExit(
+            "Auto-tuning failed to find a viable universe. "
+            "Try adjusting --exchange, --quote, --top-n, or --days."
+        )
+    settings = candidates[index]
+    log(f"Auto-tune attempt {index + 1}/{len(candidates)}.")
+    try:
+        universe, prices = _attempt_universe_build(settings, cache_dir, refresh)
+        log(
+            "Auto-tune success with "
+            f"exchange={settings.exchange}, quote={settings.quote}, "
+            f"top_n={settings.top_n}, days={settings.days}."
+        )
+        return settings, universe, prices
+    except SystemExit as exc:
+        log(f"Auto-tune attempt failed: {exc}")
+        return _recursive_autotune(candidates, cache_dir, refresh, index + 1)
+
 
 def fetch_benchmark_prices(
     days: int,
@@ -553,6 +663,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", type=str, default="data_cache")
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--cache-tag", type=str, default="v1")
+    parser.add_argument(
+        "--auto-tune",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically retry with lower top-n/days or alternate exchanges/quotes.",
+    )
     return parser.parse_args()
 
 
@@ -560,40 +676,42 @@ def main() -> None:
     args = parse_args()
     log("Starting simulation.")
     render_progress(0, 5, prefix="Setup ")
-    config = SimulationConfig(
-        days=args.days,
-        rebalance=args.rebalance,
-        stop_loss=args.stop_loss,
-        take_profit=args.take_profit,
-        weighting=args.weighting if args.weighting != "all" else "equal",
-        amounts=tuple(args.amounts),
-    )
-
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(exist_ok=True)
     render_progress(1, 5, prefix="Setup ")
     log(f"Exchange: {args.exchange}, Quote: {args.quote}")
 
-    universe = build_ccxt_universe(
-        exchange_id=args.exchange,
-        quote=args.quote,
-        top_n=args.top_n,
-        cache_dir=cache_dir,
-        refresh=args.refresh_cache,
-        cache_tag=args.cache_tag,
-        exclude_stable_bases=args.exclude_stable_bases,
-        exclude_leveraged=args.exclude_leveraged,
-        min_quote_volume=args.min_quote_volume,
-    )
-    universe.attrs["exchange_id"] = args.exchange
-    universe.attrs["cache_tag"] = args.cache_tag
-
     render_progress(2, 5, prefix="Setup ")
-    prices = build_ccxt_prices(
-        universe,
-        days=config.days,
-        cache_dir=cache_dir,
-        refresh=args.refresh_cache,
+    if args.auto_tune:
+        log("Auto-tune enabled: searching for viable universe settings.")
+        candidates = _build_candidate_settings(args)
+        chosen_settings, universe, prices = _recursive_autotune(
+            candidates, cache_dir, args.refresh_cache
+        )
+        config_days = chosen_settings.days
+    else:
+        chosen_settings = UniverseSettings(
+            exchange=args.exchange,
+            quote=args.quote,
+            top_n=args.top_n,
+            days=args.days,
+            cache_tag=args.cache_tag,
+            exclude_stable_bases=args.exclude_stable_bases,
+            exclude_leveraged=args.exclude_leveraged,
+            min_quote_volume=args.min_quote_volume,
+        )
+        universe, prices = _attempt_universe_build(
+            chosen_settings, cache_dir, args.refresh_cache
+        )
+        config_days = chosen_settings.days
+
+    config = SimulationConfig(
+        days=config_days,
+        rebalance=args.rebalance,
+        stop_loss=args.stop_loss,
+        take_profit=args.take_profit,
+        weighting=args.weighting if args.weighting != "all" else "equal",
+        amounts=tuple(args.amounts),
     )
     render_progress(3, 5, prefix="Setup ")
     benchmarks = fetch_benchmark_prices(
