@@ -445,6 +445,13 @@ def _attempt_universe_build(
     )
     return universe, prices
 
+    prices = build_ccxt_prices(
+        universe,
+        days=settings.days,
+        cache_dir=cache_dir,
+        refresh=refresh,
+    )
+    return universe, prices
 
 def _recursive_autotune(
     candidates: list[UniverseSettings],
@@ -516,8 +523,33 @@ def fetch_benchmark_prices(
 
     data = data.rename(columns={v: k for k, v in tickers.items()})
     data = data.ffill().dropna()
+    if data.empty:
+        raise SystemExit(
+            "yfinance returned no benchmark data. Check ticker availability or dates."
+        )
     atomic_to_csv(data, cache_path)
     return data
+
+
+def align_benchmarks(
+    prices: pd.DataFrame,
+    benchmarks: pd.DataFrame,
+) -> pd.DataFrame | None:
+    if benchmarks.empty:
+        return None
+    prices_index = prices.index.tz_localize(None) if prices.index.tz is not None else prices.index
+    benchmarks_index = (
+        benchmarks.index.tz_localize(None)
+        if benchmarks.index.tz is not None
+        else benchmarks.index
+    )
+    benchmarks = benchmarks.copy()
+    benchmarks.index = benchmarks_index
+    aligned = benchmarks.reindex(prices_index).ffill().dropna()
+    if aligned.empty:
+        log("Benchmarks have no overlap with price history; skipping benchmark plots.")
+        return None
+    return aligned
 
 
 def _get_rebalance_dates(index: pd.DatetimeIndex, interval: str) -> pd.DatetimeIndex:
@@ -613,7 +645,7 @@ def summarize_results(
 
 def plot_results(
     results: dict[str, dict[int, pd.Series]],
-    benchmarks: pd.DataFrame,
+    benchmarks: pd.DataFrame | None,
     amounts: tuple[int, ...],
 ) -> None:
     for strategy, amount_map in results.items():
@@ -622,14 +654,15 @@ def plot_results(
             series = amount_map[amount]
             plt.plot(series.index, series.values, label=f"{strategy} - {amount} NTD")
 
-        normalized = benchmarks / benchmarks.iloc[0]
-        for column in normalized.columns:
-            plt.plot(
-                normalized.index,
-                normalized[column] * amounts[0],
-                linestyle="--",
-                label=f"{column} (normalized)",
-            )
+        if benchmarks is not None and not benchmarks.empty:
+            normalized = benchmarks / benchmarks.iloc[0]
+            for column in normalized.columns:
+                plt.plot(
+                    normalized.index,
+                    normalized[column] * amounts[0],
+                    linestyle="--",
+                    label=f"{column} (normalized)",
+                )
 
         plt.title(f"Portfolio Value - {strategy} weighting")
         plt.xlabel("Date")
@@ -735,7 +768,7 @@ def main() -> None:
         refresh=args.refresh_cache,
         cache_tag=args.cache_tag,
     )
-    benchmarks = benchmarks.reindex(prices.index).ffill().dropna()
+    benchmarks = align_benchmarks(prices, benchmarks)
     render_progress(4, 5, prefix="Setup ")
 
     weightings = (
