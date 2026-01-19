@@ -373,6 +373,7 @@ def build_ccxt_prices(
     prices = prices.ffill().dropna()
     return prices
 
+    log(f"Cache hits: {cache_hits}, Fetches: {fetches}, Skipped: {skipped}.")
 
 def _unique_preserve_order(items: list[str]) -> list[str]:
     seen: set[str] = set()
