@@ -542,6 +542,10 @@ def align_benchmarks(
     if benchmarks.empty:
         return None
     benchmarks = benchmarks.copy()
+    if prices.index.tz is not None and benchmarks.index.tz is None:
+        benchmarks.index = benchmarks.index.tz_localize(prices.index.tz)
+    elif prices.index.tz is None and benchmarks.index.tz is not None:
+        benchmarks.index = benchmarks.index.tz_convert(None)
     aligned = benchmarks.reindex(prices.index).ffill().dropna()
     if aligned.empty:
         log("Benchmarks have no overlap with price history; skipping benchmark plots.")
