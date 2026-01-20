@@ -541,18 +541,12 @@ def align_benchmarks(
 ) -> pd.DataFrame | None:
     if benchmarks.empty:
         return None
-    prices_index = prices.index.tz_localize(None) if prices.index.tz is not None else prices.index
-    benchmarks_index = (
-        benchmarks.index.tz_localize(None)
-        if benchmarks.index.tz is not None
-        else benchmarks.index
-    )
     benchmarks = benchmarks.copy()
-    benchmarks.index = benchmarks_index
-    aligned = benchmarks.reindex(prices_index).ffill().dropna()
+    aligned = benchmarks.reindex(prices.index).ffill().dropna()
     if aligned.empty:
         log("Benchmarks have no overlap with price history; skipping benchmark plots.")
         return None
+    aligned.index = prices.index
     return aligned
 
 
@@ -667,11 +661,10 @@ def simulate_dca_asset(
     if price.empty:
         raise ValueError("Price series is empty for DCA simulation.")
     price_index = price.index
-    if price_index.tz is not None:
-        deposit_dates = deposit_dates.tz_localize("UTC") if deposit_dates.tz is None else deposit_dates
-        price_index = price_index.tz_convert("UTC")
-    else:
-        deposit_dates = deposit_dates.tz_localize(None)
+    if price_index.tz is not None and deposit_dates.tz is None:
+        deposit_dates = deposit_dates.tz_localize(price_index.tz)
+    elif price_index.tz is None and deposit_dates.tz is not None:
+        deposit_dates = deposit_dates.tz_convert(None)
     deposit_dates = deposit_dates[deposit_dates <= price_index.max()]
     if deposit_dates.empty:
         raise ValueError("No deposit dates overlap with price history.")
