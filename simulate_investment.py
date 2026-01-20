@@ -633,18 +633,24 @@ def simulate_dca_asset(
     price = price.dropna().sort_index()
     if price.empty:
         raise ValueError("Price series is empty for DCA simulation.")
-    deposit_dates = deposit_dates[deposit_dates <= price.index.max()]
+    price_index = price.index
+    if price_index.tz is not None:
+        deposit_dates = deposit_dates.tz_localize("UTC") if deposit_dates.tz is None else deposit_dates
+        price_index = price_index.tz_convert("UTC")
+    else:
+        deposit_dates = deposit_dates.tz_localize(None)
+    deposit_dates = deposit_dates[deposit_dates <= price_index.max()]
     if deposit_dates.empty:
         raise ValueError("No deposit dates overlap with price history.")
 
     units = 0.0
-    units_series = pd.Series(index=price.index, dtype=float)
+    units_series = pd.Series(index=price_index, dtype=float)
     for date in deposit_dates:
         price_at = price.loc[:date].iloc[-1]
         units += amount / price_at
         units_series.loc[date] = units
 
-    units_series = units_series.ffill().reindex(price.index).ffill()
+    units_series = units_series.ffill().reindex(price_index).ffill()
     wealth = units_series * price
     wealth.attrs["contributions"] = len(deposit_dates)
     return wealth
@@ -658,6 +664,11 @@ def simulate_fixed_deposit(
 ) -> pd.Series:
     if index.empty:
         raise ValueError("Index is empty for fixed deposit simulation.")
+    if index.tz is not None:
+        deposit_dates = deposit_dates.tz_localize("UTC") if deposit_dates.tz is None else deposit_dates
+        index = index.tz_convert("UTC")
+    else:
+        deposit_dates = deposit_dates.tz_localize(None)
     daily_rate = (1 + annual_rate) ** (1 / 365) - 1
     deposit_dates = deposit_dates[deposit_dates <= index.max()]
     if deposit_dates.empty:
