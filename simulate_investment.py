@@ -564,8 +564,13 @@ def _get_rebalance_dates(
     if mode == "fixed_interval":
         return index[::interval_days]
     if mode == "month_end":
-        months = index.to_period("M")
-        return index.groupby(months).max()
+        tzinfo = index.tz
+        index_series = index.to_series()
+        naive_series = index_series.dt.tz_localize(None) if tzinfo else index_series
+        month_ends = naive_series.groupby(naive_series.dt.to_period("M")).max()
+        if tzinfo:
+            month_ends = month_ends.dt.tz_localize(tzinfo)
+        return pd.DatetimeIndex(month_ends.values)
     raise ValueError(f"Unknown rebalance mode: {mode}")
 
 
@@ -577,10 +582,6 @@ def _format_rebalance_dates(dates: pd.DatetimeIndex, limit: int = 6) -> str:
     head = dates[: limit // 2].strftime("%Y-%m-%d").tolist()
     tail = dates[-limit // 2 :].strftime("%Y-%m-%d").tolist()
     return f"{head} ... {tail}"
-
-
-def _default_fd_annual_rate() -> float:
-    return 0.065
 
 
 def _default_fd_annual_rate() -> float:
@@ -853,13 +854,8 @@ def plot_results(
         ("2026-01-19", "Tariff shock"),
     ]
     for strategy, amount_map in results.items():
-        plt.style.use("dark_background")
-        fig, ax = plt.subplots(figsize=(16, 8), facecolor="#0b0b0b")
-        ax.set_facecolor("#0b0b0b")
-        ax.grid(True, which="both", linestyle="-", linewidth=0.6, color="#233042", alpha=0.9)
-        ax.tick_params(colors="#dfe6ee")
-        for spine in ax.spines.values():
-            spine.set_color("#2c3a4a")
+        fig, ax = plt.subplots(figsize=(16, 8))
+        ax.grid(True, which="both", linestyle="-", linewidth=0.6, alpha=0.4)
         colors = plt.cm.tab10(np.linspace(0, 1, len(amounts)))
         amount_colors = dict(zip(amounts, colors, strict=False))
         for amount in amounts:
@@ -888,7 +884,7 @@ def plot_results(
             if plot_index.tz is not None and event_date.tz is None:
                 event_date = event_date.tz_localize(plot_index.tz)
             if plot_index.min() <= event_date <= plot_index.max():
-                ax.axvline(event_date, color="#3b4b5b", linestyle="--", alpha=0.6)
+                ax.axvline(event_date, color="grey", linestyle="--", alpha=0.6)
                 ax.text(
                     event_date,
                     max_value * 1.02,
@@ -897,12 +893,11 @@ def plot_results(
                     va="bottom",
                     ha="center",
                     fontsize=8,
-                    color="#c9d4e0",
                 )
 
-        ax.set_title(f"Portfolio Value - {strategy} weighting", color="#e6edf3")
-        ax.set_xlabel("Date", color="#c9d4e0")
-        ax.set_ylabel("Value (units)", color="#c9d4e0")
+        ax.set_title(f"Portfolio Value - {strategy} weighting")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Value (units)")
         amount_handles = [
             Line2D([0], [0], color=amount_colors[amount], linewidth=2)
             for amount in amounts
@@ -927,10 +922,6 @@ def plot_results(
             title="Monthly Amount",
             loc="upper left",
             fontsize=9,
-            frameon=True,
-            facecolor="#0b0b0b",
-            edgecolor="#2c3a4a",
-            labelcolor="#dfe6ee",
             title_fontsize=9,
         )
         ax.add_artist(legend_amounts)
@@ -940,14 +931,10 @@ def plot_results(
             title="Series Type",
             loc="upper right",
             fontsize=9,
-            frameon=True,
-            facecolor="#0b0b0b",
-            edgecolor="#2c3a4a",
-            labelcolor="#dfe6ee",
             title_fontsize=9,
         )
         fig.tight_layout()
-        fig.savefig(f"portfolio_{strategy}.png", facecolor=fig.get_facecolor())
+        fig.savefig(f"portfolio_{strategy}.png")
         plt.close(fig)
 
 
