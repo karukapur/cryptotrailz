@@ -31,6 +31,7 @@ except ImportError as exc:  # pragma: no cover - handled at runtime
     ) from exc
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 # Treat cached data with fewer than 80% of expected rows as invalid.
 EXPECTED_COMPLETENESS_RATIO = 0.8
@@ -75,10 +76,13 @@ def render_progress(current: int, total: int, prefix: str = "") -> None:
 class SimulationConfig:
     days: int = 444
     rebalance: str = "monthly"
+    rebalance_mode: str = "month_end"
+    interval_days: int = 30
     stop_loss: float = 0.20
     take_profit: float = 0.50
     weighting: str = "equal"
     amounts: tuple[int, ...] = (1000, 2000, 3000, 4000, 5000)
+    deposit_timing: str = "start"
 
 
 @dataclass(frozen=True)
@@ -552,12 +556,36 @@ def align_benchmarks(
     return aligned
 
 
-def _get_rebalance_dates(index: pd.DatetimeIndex, interval: str) -> pd.DatetimeIndex:
-    if interval == "weekly":
-        return index[::7]
-    if interval == "quarterly":
-        return index[::90]
-    return index[index.is_month_end]
+def _get_rebalance_dates(
+    index: pd.DatetimeIndex,
+    mode: str,
+    interval_days: int,
+) -> pd.DatetimeIndex:
+    if mode == "fixed_interval":
+        return index[::interval_days]
+    if mode == "month_end":
+        tzinfo = index.tz
+        index_series = index.to_series()
+        naive_series = index_series.dt.tz_localize(None) if tzinfo else index_series
+        month_ends = naive_series.groupby(naive_series.dt.to_period("M")).max()
+        if tzinfo:
+            month_ends = month_ends.dt.tz_localize(tzinfo)
+        return pd.DatetimeIndex(month_ends.values)
+    raise ValueError(f"Unknown rebalance mode: {mode}")
+
+
+def _format_rebalance_dates(dates: pd.DatetimeIndex, limit: int = 6) -> str:
+    if dates.empty:
+        return "[]"
+    if len(dates) <= limit:
+        return dates.strftime("%Y-%m-%d").tolist().__repr__()
+    head = dates[: limit // 2].strftime("%Y-%m-%d").tolist()
+    tail = dates[-limit // 2 :].strftime("%Y-%m-%d").tolist()
+    return f"{head} ... {tail}"
+
+
+def _default_fd_annual_rate() -> float:
+    return 0.065
 
 
 def compute_weights(
@@ -590,38 +618,168 @@ def apply_stop_take_profit(
     return capped
 
 
-def simulate_portfolio(
+def simulate_portfolio_daily(
     prices: pd.DataFrame,
     amount: int,
     config: SimulationConfig,
+    rebalance_dates: pd.DatetimeIndex,
 ) -> pd.Series:
-    rebalance_dates = _get_rebalance_dates(prices.index, config.rebalance)
+    """Daily mark-to-market portfolio simulation with explicit cashflows.
+
+    Note: per-asset stop-loss/take-profit clipping is disabled to avoid bias.
+    """
     if rebalance_dates.empty:
         raise ValueError("No rebalance dates found for the given price history.")
 
     portfolio_value = pd.Series(index=prices.index, dtype=float)
-    current_value = 0.0
-    last_rebalance = rebalance_dates[0]
+    cash = 0.0
+    holdings = pd.Series(0.0, index=prices.columns)
 
-    for date in rebalance_dates:
-        current_value += amount
-        start_prices = prices.loc[last_rebalance]
-        end_prices = prices.loc[date]
-        returns = (end_prices / start_prices) - 1
-        returns = apply_stop_take_profit(returns, config.stop_loss, config.take_profit)
-        weights = compute_weights(prices.loc[:date], config.weighting)
-        period_return = (weights * returns).sum()
-        current_value *= 1 + period_return
-        portfolio_value.loc[date] = current_value
-        last_rebalance = date
+    for date, price_row in prices.iterrows():
+        is_rebalance = date in rebalance_dates
+        if is_rebalance and config.deposit_timing == "start":
+            cash += amount
 
-    portfolio_value = portfolio_value.ffill()
+        if is_rebalance:
+            total_value = cash + (holdings * price_row).sum()
+            weights = compute_weights(prices.loc[:date], config.weighting)
+            target_value = total_value * weights
+            holdings = target_value / price_row
+            cash = total_value - (holdings * price_row).sum()
+
+        if is_rebalance and config.deposit_timing == "end":
+            cash += amount
+
+        portfolio_value.loc[date] = cash + (holdings * price_row).sum()
+
     portfolio_value.attrs["contributions"] = len(rebalance_dates)
     return portfolio_value
 
 
+def simulate_dca_asset(
+    price: pd.Series,
+    amount: int,
+    deposit_dates: pd.DatetimeIndex,
+    deposit_timing: str,
+) -> pd.Series:
+    """Daily DCA benchmark simulation with explicit cashflow timing."""
+    price = price.dropna().sort_index()
+    if price.empty:
+        raise ValueError("Price series is empty for DCA simulation.")
+    price_index = price.index
+    if price_index.tz is not None:
+        deposit_dates = deposit_dates.tz_localize("UTC") if deposit_dates.tz is None else deposit_dates
+        price_index = price_index.tz_convert("UTC")
+    else:
+        deposit_dates = deposit_dates.tz_localize(None)
+    deposit_dates = deposit_dates[deposit_dates <= price_index.max()]
+    if deposit_dates.empty:
+        raise ValueError("No deposit dates overlap with price history.")
+
+    units = 0.0
+    wealth = pd.Series(index=price_index, dtype=float)
+    for date in price_index:
+        if date in deposit_dates and deposit_timing == "start":
+            units += amount / price.loc[date]
+        wealth.loc[date] = units * price.loc[date]
+        if date in deposit_dates and deposit_timing == "end":
+            units += amount / price.loc[date]
+            wealth.loc[date] = units * price.loc[date]
+    wealth.attrs["contributions"] = len(deposit_dates)
+    return wealth
+
+
+def simulate_fixed_deposit(
+    amount: int,
+    deposit_dates: pd.DatetimeIndex,
+    index: pd.DatetimeIndex,
+    annual_rate: float,
+    deposit_timing: str,
+) -> pd.Series:
+    """Daily fixed-deposit benchmark with per-deposit compounding."""
+    if index.empty:
+        raise ValueError("Index is empty for fixed deposit simulation.")
+    if index.tz is not None:
+        deposit_dates = (
+            deposit_dates.tz_localize("UTC")
+            if deposit_dates.tz is None
+            else deposit_dates
+        )
+        index = index.tz_convert("UTC")
+    else:
+        deposit_dates = deposit_dates.tz_localize(None)
+    daily_rate = (1 + annual_rate) ** (1 / 365) - 1
+    deposit_dates = deposit_dates[deposit_dates <= index.max()]
+    if deposit_dates.empty:
+        raise ValueError("No deposit dates overlap with fixed deposit timeline.")
+    deposit_dates = deposit_dates.sort_values()
+
+    wealth = pd.Series(index=index, dtype=float)
+    balance = 0.0
+    for date in index:
+        if date in deposit_dates and deposit_timing == "start":
+            balance += amount
+        balance *= 1 + daily_rate
+        if date in deposit_dates and deposit_timing == "end":
+            balance += amount
+        wealth.loc[date] = balance
+
+    wealth.attrs["contributions"] = len(deposit_dates)
+    return wealth
+
+
+def _annualized_metrics(series: pd.Series) -> tuple[float, float]:
+    returns = series.pct_change().dropna()
+    if returns.empty:
+        return float("nan"), float("nan")
+    years = len(returns) / 365
+    if series.iloc[0] <= 0:
+        return float("nan"), float("nan")
+    total_return = series.iloc[-1] / series.iloc[0]
+    annual_return = total_return ** (1 / years) - 1 if years > 0 else float("nan")
+    annual_volatility = returns.std() * np.sqrt(365)
+    return annual_return, annual_volatility
+
+
+def assert_consistency(
+    results: dict[str, dict[int, pd.Series]],
+    benchmark_results: dict[str, dict[int, pd.Series]],
+) -> None:
+    for strategy, amount_map in results.items():
+        for amount, series in amount_map.items():
+            for name, benchmark_map in benchmark_results.items():
+                benchmark_series = benchmark_map[amount]
+                if not series.index.equals(benchmark_series.index):
+                    raise ValueError(
+                        f"Index mismatch for {strategy} {amount} vs {name} benchmark."
+                    )
+            contributions = series.attrs.get("contributions", len(series.dropna()))
+            invested = amount * contributions
+            benchmark_finals = ", ".join(
+                f"{name}={benchmark_map[amount].iloc[-1]:.2f}"
+                for name, benchmark_map in benchmark_results.items()
+            )
+            log(
+                "Reconcile | "
+                f"{strategy} | {amount} | "
+                f"Final={series.iloc[-1]:.2f} | "
+                f"Max={series.max():.2f} | "
+                f"Invested={invested:.2f} | "
+                f"{benchmark_finals}"
+            )
+
+
+def compute_max_drawdown(series: pd.Series) -> float:
+    if series.empty:
+        return float("nan")
+    drawdowns = series / series.cummax() - 1
+    return drawdowns.min()
+
+
 def summarize_results(
-    results: dict[str, dict[int, pd.Series]], amounts: tuple[int, ...]
+    results: dict[str, dict[int, pd.Series]],
+    benchmark_results: dict[str, dict[int, pd.Series]],
+    amounts: tuple[int, ...],
 ) -> pd.DataFrame:
     rows = []
     for strategy, amount_map in results.items():
@@ -629,48 +787,155 @@ def summarize_results(
             series = amount_map[amount]
             contributions = series.attrs.get("contributions", len(series.dropna()))
             total_invested = amount * contributions
-            final_value = series.dropna().iloc[-1]
+            final_value = series.iloc[-1]
             profit = final_value - total_invested
-            rows.append(
-                {
-                    "Strategy": strategy,
-                    "Amount": amount,
-                    "Total Invested": total_invested,
-                    "Final Value": final_value,
-                    "Profit": profit,
-                }
-            )
+            annual_return, annual_volatility = _annualized_metrics(series)
+            row = {
+                "Strategy": strategy,
+                "Amount": amount,
+                "Total Invested": total_invested,
+                "Final Value": final_value,
+                "Profit": profit,
+                "Max Drawdown": compute_max_drawdown(series.dropna()),
+                "Annualized Return": annual_return,
+                "Annualized Volatility": annual_volatility,
+            }
+            for name, amount_map in benchmark_results.items():
+                benchmark_series = amount_map[amount]
+                benchmark_final = benchmark_series.iloc[-1]
+                benchmark_profit = benchmark_final - total_invested
+                bench_ann_return, bench_ann_vol = _annualized_metrics(benchmark_series)
+                row[f"{name} Final Value"] = benchmark_final
+                row[f"{name} Profit"] = benchmark_profit
+                row[f"{name} Max Drawdown"] = compute_max_drawdown(
+                    benchmark_series.dropna()
+                )
+                row[f"{name} Annualized Return"] = bench_ann_return
+                row[f"{name} Annualized Volatility"] = bench_ann_vol
+            if "NASDAQ" in benchmark_results:
+                row["Outperform_NASDAQ"] = (
+                    final_value
+                    > benchmark_results["NASDAQ"][amount].iloc[-1]
+                )
+            if "Nifty50" in benchmark_results:
+                row["Outperform_NIFTY"] = (
+                    final_value
+                    > benchmark_results["Nifty50"][amount].iloc[-1]
+                )
+            if "Fixed Deposit" in benchmark_results:
+                row["Outperform_FD"] = (
+                    final_value
+                    > benchmark_results["Fixed Deposit"][amount].iloc[-1]
+                )
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
 def plot_results(
     results: dict[str, dict[int, pd.Series]],
-    benchmarks: pd.DataFrame | None,
+    benchmark_results: dict[str, dict[int, pd.Series]],
     amounts: tuple[int, ...],
 ) -> None:
+    benchmark_styles = {
+        "Bitcoin": "--",
+        "NASDAQ": (0, (5, 2)),
+        "Nifty50": (0, (3, 2, 1, 2)),
+        "Fixed Deposit": ":",
+    }
+    events = [
+        ("2024-11-06", "Trump win"),
+        ("2024-12-05", "ETF repricing"),
+        ("2025-02-25", "Tariff hack"),
+        ("2025-06-13", "Israel Iran"),
+        ("2025-10-05", "ETF ATH"),
+        ("2025-10-10", "Liquidation"),
+        ("2025-11-18", "Post peak"),
+        ("2025-12-26", "Flash wick"),
+        ("2026-01-19", "Tariff shock"),
+    ]
     for strategy, amount_map in results.items():
-        plt.figure(figsize=(12, 6))
+        fig, ax = plt.subplots(figsize=(16, 8))
+        ax.grid(True, which="both", linestyle="-", linewidth=0.6, alpha=0.4)
+        colors = plt.cm.tab10(np.linspace(0, 1, len(amounts)))
+        amount_colors = dict(zip(amounts, colors, strict=False))
         for amount in amounts:
             series = amount_map[amount]
-            plt.plot(series.index, series.values, label=f"{strategy} - {amount} NTD")
+            ax.plot(
+                series.index,
+                series.values,
+                color=amount_colors[amount],
+                linewidth=2,
+            )
 
-        if benchmarks is not None and not benchmarks.empty:
-            normalized = benchmarks / benchmarks.iloc[0]
-            for column in normalized.columns:
-                plt.plot(
-                    normalized.index,
-                    normalized[column] * amounts[0],
-                    linestyle="--",
-                    label=f"{column} (normalized)",
+            for benchmark_name, benchmark_map in benchmark_results.items():
+                benchmark_series = benchmark_map[amount]
+                ax.plot(
+                    benchmark_series.index,
+                    benchmark_series.values,
+                    color=amount_colors[amount],
+                    linestyle=benchmark_styles.get(benchmark_name, "--"),
+                    alpha=0.7,
                 )
 
-        plt.title(f"Portfolio Value - {strategy} weighting")
-        plt.xlabel("Date")
-        plt.ylabel("Value (NTD)")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(f"portfolio_{strategy}.png")
-        plt.close()
+        plot_index = next(iter(amount_map.values())).index
+        max_value = max(series.max() for series in amount_map.values())
+        for date_str, label in events:
+            event_date = pd.Timestamp(date_str)
+            if plot_index.tz is not None and event_date.tz is None:
+                event_date = event_date.tz_localize(plot_index.tz)
+            if plot_index.min() <= event_date <= plot_index.max():
+                ax.axvline(event_date, color="grey", linestyle="--", alpha=0.6)
+                ax.text(
+                    event_date,
+                    max_value * 1.02,
+                    label,
+                    rotation=90,
+                    va="bottom",
+                    ha="center",
+                    fontsize=8,
+                )
+
+        ax.set_title(f"Portfolio Value - {strategy} weighting")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Value (units)")
+        amount_handles = [
+            Line2D([0], [0], color=amount_colors[amount], linewidth=2)
+            for amount in amounts
+        ]
+        amount_labels = [f"{amount} units" for amount in amounts]
+        benchmark_handles = [
+            Line2D([0], [0], color="black", linestyle="-", linewidth=2),
+            *[
+                Line2D(
+                    [0],
+                    [0],
+                    color="black",
+                    linestyle=benchmark_styles.get(name, "--"),
+                )
+                for name in benchmark_results.keys()
+            ],
+        ]
+        benchmark_labels = ["Crypto strategy", *list(benchmark_results.keys())]
+        legend_amounts = ax.legend(
+            amount_handles,
+            amount_labels,
+            title="Monthly Amount",
+            loc="upper left",
+            fontsize=9,
+            title_fontsize=9,
+        )
+        ax.add_artist(legend_amounts)
+        ax.legend(
+            benchmark_handles,
+            benchmark_labels,
+            title="Series Type",
+            loc="upper right",
+            fontsize=9,
+            title_fontsize=9,
+        )
+        fig.tight_layout()
+        fig.savefig(f"portfolio_{strategy}.png")
+        plt.close(fig)
 
 
 def parse_args() -> argparse.Namespace:
@@ -685,6 +950,24 @@ def parse_args() -> argparse.Namespace:
         "--weighting",
         choices=["equal", "volatility", "momentum", "all"],
         default="all",
+    )
+    parser.add_argument(
+        "--deposit-timing",
+        choices=["start", "end"],
+        default="start",
+        help="Apply contributions at the start or end of rebalance day.",
+    )
+    parser.add_argument(
+        "--rebalance-mode",
+        choices=["month_end", "fixed_interval"],
+        default="month_end",
+        help="Rebalance schedule generator for monthly mode.",
+    )
+    parser.add_argument(
+        "--interval-days",
+        type=int,
+        default=30,
+        help="Interval in days for fixed-interval rebalancing.",
     )
     parser.add_argument("--stop-loss", type=float, default=0.20)
     parser.add_argument("--take-profit", type=float, default=0.50)
@@ -716,6 +999,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Automatically retry with lower top-n/days or alternate exchanges/quotes.",
+    )
+    parser.add_argument(
+        "--fd-annual-rate",
+        type=float,
+        default=None,
+        help="Annualized fixed deposit rate (e.g., 0.0645 for 6.45%).",
     )
     return parser.parse_args()
 
@@ -756,12 +1045,17 @@ def main() -> None:
     config = SimulationConfig(
         days=config_days,
         rebalance=args.rebalance,
+        rebalance_mode=args.rebalance_mode,
+        interval_days=args.interval_days,
         stop_loss=args.stop_loss,
         take_profit=args.take_profit,
         weighting=args.weighting if args.weighting != "all" else "equal",
         amounts=tuple(args.amounts),
+        deposit_timing=args.deposit_timing,
     )
     render_progress(3, 5, prefix="Setup ")
+    log("WARNING: Currency conversion not applied; values are comparative.")
+    log(f"Deposit timing: {config.deposit_timing}")
     benchmarks = fetch_benchmark_prices(
         config.days,
         cache_dir=cache_dir,
@@ -775,20 +1069,71 @@ def main() -> None:
         ["equal", "volatility", "momentum"] if args.weighting == "all" else [args.weighting]
     )
 
+    rebalance_mode = config.rebalance_mode
+    interval_days = config.interval_days
+    if config.rebalance == "weekly":
+        rebalance_mode = "fixed_interval"
+        interval_days = 7
+    elif config.rebalance == "quarterly":
+        rebalance_mode = "fixed_interval"
+        interval_days = 90
+    else:
+        rebalance_mode = "month_end"
+    rebalance_dates = _get_rebalance_dates(prices.index, rebalance_mode, interval_days)
+    log(
+        "Rebalance dates: "
+        f"{_format_rebalance_dates(rebalance_dates)} "
+        f"(count={len(rebalance_dates)})"
+    )
+    if benchmarks is None or benchmarks.empty:
+        raise SystemExit("Benchmarks are required for DCA comparisons.")
+
+    fd_annual_rate = (
+        args.fd_annual_rate if args.fd_annual_rate is not None else _default_fd_annual_rate()
+    )
+    log(f"Fixed deposit annual rate: {fd_annual_rate:.4%}")
+
+    benchmark_results: dict[str, dict[int, pd.Series]] = {
+        "Bitcoin": {},
+        "NASDAQ": {},
+        "Nifty50": {},
+        "Fixed Deposit": {},
+    }
+    for amount in config.amounts:
+        benchmark_results["Bitcoin"][amount] = simulate_dca_asset(
+            benchmarks["Bitcoin"], amount, rebalance_dates, config.deposit_timing
+        )
+        benchmark_results["NASDAQ"][amount] = simulate_dca_asset(
+            benchmarks["NASDAQ"], amount, rebalance_dates, config.deposit_timing
+        )
+        benchmark_results["Nifty50"][amount] = simulate_dca_asset(
+            benchmarks["Nifty50"], amount, rebalance_dates, config.deposit_timing
+        )
+        benchmark_results["Fixed Deposit"][amount] = simulate_fixed_deposit(
+            amount,
+            rebalance_dates,
+            prices.index,
+            fd_annual_rate,
+            config.deposit_timing,
+        )
+
     results: dict[str, dict[int, pd.Series]] = {}
     for weighting in weightings:
         log(f"Running simulations for weighting={weighting}.")
         config.weighting = weighting
         results[weighting] = {}
         for amount in config.amounts:
-            log(f"Simulating amount {amount} NTD.")
-            results[weighting][amount] = simulate_portfolio(prices, amount, config)
+            log(f"Simulating amount {amount} units.")
+            results[weighting][amount] = simulate_portfolio_daily(
+                prices, amount, config, rebalance_dates
+            )
 
-    summary = summarize_results(results, config.amounts)
+    assert_consistency(results, benchmark_results)
+    summary = summarize_results(results, benchmark_results, config.amounts)
     summary.to_csv("performance_summary.csv", index=False)
     log("Simulation summary:")
     log(summary.to_string(index=False))
-    plot_results(results, benchmarks, config.amounts)
+    plot_results(results, benchmark_results, config.amounts)
     render_progress(5, 5, prefix="Setup ")
     log("Finished. Outputs: performance_summary.csv and portfolio_*.png files.")
 
