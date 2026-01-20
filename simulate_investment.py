@@ -10,28 +10,19 @@ from __future__ import annotations
 import argparse
 import time
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 
-try:
-    import ccxt
-except ImportError as exc:  # pragma: no cover - handled at runtime
-    raise SystemExit(
-        "ccxt is required for crypto exchange data. Install with `pip install ccxt`."
-    ) from exc
-
-try:
-    import yfinance as yf
-except ImportError as exc:  # pragma: no cover - handled at runtime
-    raise SystemExit(
-        "yfinance is required for benchmark data. Install with `pip install yfinance`."
-    ) from exc
-
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import ccxt
+    import yfinance
 
 # Treat cached data with fewer than 80% of expected rows as invalid.
 EXPECTED_COMPLETENESS_RATIO = 0.8
@@ -61,6 +52,18 @@ STABLE_BASES = {
 
 def log(message: str) -> None:
     print(message, flush=True)
+
+
+def _get_ccxt_module():
+    import importlib
+
+    return importlib.import_module("ccxt")
+
+
+def _get_yfinance_module():
+    import importlib
+
+    return importlib.import_module("yfinance")
 
 
 def render_progress(current: int, total: int, prefix: str = "") -> None:
@@ -160,6 +163,7 @@ def _extract_quote_volume(ticker: dict[str, Any]) -> float | None:
 
 
 def _ccxt_call_with_retry(func, *args, **kwargs):
+    ccxt = _get_ccxt_module()
     for attempt in range(3):
         try:
             return func(*args, **kwargs)
@@ -194,6 +198,7 @@ def build_ccxt_universe(
         if cached is not None:
             log(f"CACHE INVALID: {cache_path} (refetching)")
 
+    ccxt = _get_ccxt_module()
     try:
         exchange_class = getattr(ccxt, exchange_id)
     except AttributeError as exc:
@@ -269,7 +274,7 @@ def build_ccxt_universe(
 
 
 def fetch_ccxt_ohlcv_series(
-    exchange: ccxt.Exchange,
+    exchange: Any,
     symbol: str,
     days: int,
     cache_dir: Path,
@@ -335,6 +340,7 @@ def build_ccxt_prices(
     if not exchange_id:
         raise SystemExit("Universe is missing exchange metadata.")
 
+    ccxt = _get_ccxt_module()
     exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
     _ccxt_call_with_retry(exchange.load_markets)
 
@@ -504,6 +510,7 @@ def fetch_benchmark_prices(
     start = end - pd.Timedelta(days=days)
     tickers = {"Bitcoin": "BTC-USD", "Nifty50": "^NSEI", "NASDAQ": "^IXIC"}
     log(f"FETCH: yfinance benchmarks -> {cache_path}")
+    yf = _get_yfinance_module()
     downloaded = yf.download(
         list(tickers.values()),
         start=start.strftime("%Y-%m-%d"),
@@ -554,6 +561,31 @@ def align_benchmarks(
     return aligned
 
 
+def normalize_datetime_index(
+    index: pd.DatetimeIndex, target_tz: str | None
+) -> pd.DatetimeIndex:
+    if index.tz is None and target_tz is not None:
+        index = index.tz_localize(target_tz)
+    elif index.tz is not None and target_tz is None:
+        index = index.tz_convert(None)
+    elif index.tz is not None and target_tz is not None:
+        index = index.tz_convert(target_tz)
+    return index.normalize()
+
+
+def normalize_timestamp(ts: pd.Timestamp, target_tz: str | None) -> pd.Timestamp:
+    timestamp = pd.Timestamp(ts)
+    if target_tz is not None:
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize(target_tz)
+        else:
+            timestamp = timestamp.tz_convert(target_tz)
+    else:
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_convert(None)
+    return timestamp.normalize()
+
+
 def _get_rebalance_dates(
     index: pd.DatetimeIndex,
     mode: str,
@@ -563,11 +595,13 @@ def _get_rebalance_dates(
         return index[::interval_days]
     if mode == "month_end":
         tzinfo = index.tz
-        index_series = index.to_series()
-        naive_series = index_series.dt.tz_localize(None) if tzinfo else index_series
-        month_ends = naive_series.groupby(naive_series.dt.to_period("M")).max()
-        if tzinfo:
-            month_ends = month_ends.dt.tz_localize(tzinfo)
+        naive_index = index.tz_convert(None) if tzinfo else index
+        month_groups = pd.DataFrame(
+            {"original": index, "naive": naive_index}, index=index
+        )
+        month_ends = month_groups.groupby(month_groups["naive"].dt.to_period("M"))[
+            "original"
+        ].max()
         return pd.DatetimeIndex(month_ends.values)
     raise ValueError(f"Unknown rebalance mode: {mode}")
 
@@ -632,11 +666,25 @@ def simulate_portfolio_daily(
     portfolio_value = pd.Series(index=prices.index, dtype=float)
     cash = 0.0
     holdings = pd.Series(0.0, index=prices.columns)
+    deposits_applied = 0
+    rebalances_executed = 0
+    last_weights: pd.Series | None = None
+    last_rebalance_date: pd.Timestamp | None = None
+
+    normalized_index = normalize_datetime_index(prices.index, prices.index.tz)
+    normalized_rebalance_dates = normalize_datetime_index(
+        pd.DatetimeIndex(rebalance_dates), prices.index.tz
+    )
+    rebalance_set = set(normalized_rebalance_dates)
+    index_set = set(normalized_index)
+    overlap_count = len({date for date in normalized_rebalance_dates if date in index_set})
 
     for date, price_row in prices.iterrows():
-        is_rebalance = date in rebalance_dates
+        normalized_date = normalize_timestamp(date, prices.index.tz)
+        is_rebalance = normalized_date in rebalance_set
         if is_rebalance and config.deposit_timing == "start":
             cash += amount
+            deposits_applied += 1
 
         if is_rebalance:
             total_value = cash + (holdings * price_row).sum()
@@ -644,13 +692,24 @@ def simulate_portfolio_daily(
             target_value = total_value * weights
             holdings = target_value / price_row
             cash = total_value - (holdings * price_row).sum()
+            rebalances_executed += 1
+            last_weights = weights
+            last_rebalance_date = normalized_date
 
         if is_rebalance and config.deposit_timing == "end":
             cash += amount
+            deposits_applied += 1
 
         portfolio_value.loc[date] = cash + (holdings * price_row).sum()
 
     portfolio_value.attrs["contributions"] = len(rebalance_dates)
+    portfolio_value.attrs["deposits_applied"] = deposits_applied
+    portfolio_value.attrs["rebalances_executed"] = rebalances_executed
+    portfolio_value.attrs["rebalance_overlap"] = overlap_count
+    if last_weights is not None:
+        portfolio_value.attrs["last_weights"] = last_weights.to_dict()
+    if last_rebalance_date is not None:
+        portfolio_value.attrs["last_rebalance_date"] = last_rebalance_date.isoformat()
     return portfolio_value
 
 
@@ -665,21 +724,25 @@ def simulate_dca_asset(
     if price.empty:
         raise ValueError("Price series is empty for DCA simulation.")
     price_index = price.index
-    if price_index.tz is not None and deposit_dates.tz is None:
-        deposit_dates = deposit_dates.tz_localize(price_index.tz)
-    elif price_index.tz is None and deposit_dates.tz is not None:
-        deposit_dates = deposit_dates.tz_convert(None)
-    deposit_dates = deposit_dates[deposit_dates <= price_index.max()]
+    normalized_index = normalize_datetime_index(price_index, price_index.tz)
+    normalized_deposits = normalize_datetime_index(
+        pd.DatetimeIndex(deposit_dates), price_index.tz
+    )
+    index_set = set(normalized_index)
+    deposit_dates = pd.DatetimeIndex(
+        [date for date in normalized_deposits if date in index_set]
+    )
     if deposit_dates.empty:
         raise ValueError("No deposit dates overlap with price history.")
 
     units = 0.0
     wealth = pd.Series(index=price_index, dtype=float)
     for date in price_index:
-        if date in deposit_dates and deposit_timing == "start":
+        normalized_date = normalize_timestamp(date, price_index.tz)
+        if normalized_date in deposit_dates and deposit_timing == "start":
             units += amount / price.loc[date]
         wealth.loc[date] = units * price.loc[date]
-        if date in deposit_dates and deposit_timing == "end":
+        if normalized_date in deposit_dates and deposit_timing == "end":
             units += amount / price.loc[date]
             wealth.loc[date] = units * price.loc[date]
     wealth.attrs["contributions"] = len(deposit_dates)
@@ -696,17 +759,15 @@ def simulate_fixed_deposit(
     """Daily fixed-deposit benchmark with per-deposit compounding."""
     if index.empty:
         raise ValueError("Index is empty for fixed deposit simulation.")
-    if index.tz is not None:
-        deposit_dates = (
-            deposit_dates.tz_localize("UTC")
-            if deposit_dates.tz is None
-            else deposit_dates
-        )
-        index = index.tz_convert("UTC")
-    else:
-        deposit_dates = deposit_dates.tz_localize(None)
+    normalized_index = normalize_datetime_index(index, index.tz)
+    normalized_deposits = normalize_datetime_index(
+        pd.DatetimeIndex(deposit_dates), index.tz
+    )
+    index_set = set(normalized_index)
     daily_rate = (1 + annual_rate) ** (1 / 365) - 1
-    deposit_dates = deposit_dates[deposit_dates <= index.max()]
+    deposit_dates = pd.DatetimeIndex(
+        [date for date in normalized_deposits if date in index_set]
+    )
     if deposit_dates.empty:
         raise ValueError("No deposit dates overlap with fixed deposit timeline.")
     deposit_dates = deposit_dates.sort_values()
@@ -714,10 +775,11 @@ def simulate_fixed_deposit(
     wealth = pd.Series(index=index, dtype=float)
     balance = 0.0
     for date in index:
-        if date in deposit_dates and deposit_timing == "start":
+        normalized_date = normalize_timestamp(date, index.tz)
+        if normalized_date in deposit_dates and deposit_timing == "start":
             balance += amount
         balance *= 1 + daily_rate
-        if date in deposit_dates and deposit_timing == "end":
+        if normalized_date in deposit_dates and deposit_timing == "end":
             balance += amount
         wealth.loc[date] = balance
 
@@ -726,6 +788,7 @@ def simulate_fixed_deposit(
 
 
 def _annualized_metrics(series: pd.Series) -> tuple[float, float]:
+    series = series[series > 0]
     returns = series.pct_change().dropna()
     if returns.empty:
         return float("nan"), float("nan")
@@ -736,6 +799,136 @@ def _annualized_metrics(series: pd.Series) -> tuple[float, float]:
     annual_return = total_return ** (1 / years) - 1 if years > 0 else float("nan")
     annual_volatility = returns.std() * np.sqrt(365)
     return annual_return, annual_volatility
+
+
+def _build_cashflows(
+    series: pd.Series,
+    amount: int,
+    deposit_dates: pd.DatetimeIndex,
+) -> list[tuple[pd.Timestamp, float]]:
+    normalized_index = normalize_datetime_index(series.index, series.index.tz)
+    normalized_deposits = normalize_datetime_index(
+        pd.DatetimeIndex(deposit_dates), series.index.tz
+    )
+    index_set = set(normalized_index)
+    cashflows: list[tuple[pd.Timestamp, float]] = []
+    for date in normalized_deposits:
+        if date in index_set:
+            cashflows.append((date, -float(amount)))
+    cashflows.append((normalized_index[-1], float(series.iloc[-1])))
+    return cashflows
+
+
+def compute_xirr(cashflows: list[tuple[pd.Timestamp, float]]) -> float:
+    if not cashflows:
+        return float("nan")
+    cashflows = sorted(cashflows, key=lambda item: item[0])
+    amounts = [amount for _, amount in cashflows]
+    if not (any(amount < 0 for amount in amounts) and any(amount > 0 for amount in amounts)):
+        return float("nan")
+    start_date = cashflows[0][0]
+
+    def xnpv(rate: float) -> float:
+        return sum(
+            amount / (1 + rate) ** ((date - start_date).days / 365)
+            for date, amount in cashflows
+        )
+
+    def xnpv_derivative(rate: float) -> float:
+        total = 0.0
+        for date, amount in cashflows:
+            years = (date - start_date).days / 365
+            total -= (years * amount) / (1 + rate) ** (years + 1)
+        return total
+
+    guess = 0.1
+    import importlib.util
+
+    spec = importlib.util.find_spec("scipy.optimize")
+    if spec is not None:
+        import importlib
+
+        scipy_opt = importlib.import_module("scipy.optimize")
+        try:
+            return float(
+                scipy_opt.newton(xnpv, guess, fprime=xnpv_derivative, maxiter=100)
+            )
+        except Exception:  # pragma: no cover - fallback path
+            pass
+
+    rate = guess
+    for _ in range(100):
+        value = xnpv(rate)
+        derivative = xnpv_derivative(rate)
+        if derivative == 0:
+            break
+        next_rate = rate - value / derivative
+        if abs(next_rate - rate) < 1e-8:
+            return float(next_rate)
+        rate = next_rate
+
+    low, high = -0.9999, 10.0
+    for _ in range(200):
+        mid = (low + high) / 2
+        value = xnpv(mid)
+        if abs(value) < 1e-6:
+            return float(mid)
+        if value > 0:
+            low = mid
+        else:
+            high = mid
+
+    log(f"WARNING: XIRR failed to converge for cashflows starting {start_date}.")
+    return float("nan")
+
+
+def assert_not_identical_series(
+    series_a: pd.Series,
+    series_b: pd.Series,
+    label_a: str,
+    label_b: str,
+    min_length: int = 30,
+    tolerance: float = 1e-8,
+) -> None:
+    if len(series_a) <= min_length or len(series_b) <= min_length:
+        return
+    if series_a.index.equals(series_b.index) and np.allclose(
+        series_a.values, series_b.values, rtol=tolerance, atol=tolerance, equal_nan=True
+    ):
+        raise ValueError(f"{label_a} is identical to {label_b} for {len(series_a)} rows.")
+
+
+def _assert_strategy_divergence(
+    results: dict[str, dict[int, pd.Series]],
+    amounts: tuple[int, ...],
+) -> None:
+    strategies = list(results.keys())
+    if len(strategies) < 2:
+        return
+    for amount in amounts:
+        for i, strategy_a in enumerate(strategies):
+            for strategy_b in strategies[i + 1 :]:
+                series_a = results[strategy_a][amount]
+                series_b = results[strategy_b][amount]
+                if len(series_a) <= 30 or len(series_b) <= 30:
+                    continue
+                if series_a.index.equals(series_b.index) and np.allclose(
+                    series_a.values,
+                    series_b.values,
+                    rtol=1e-8,
+                    atol=1e-8,
+                    equal_nan=True,
+                ):
+                    weights_a = series_a.attrs.get("last_weights")
+                    weights_b = series_b.attrs.get("last_weights")
+                    last_date_a = series_a.attrs.get("last_rebalance_date")
+                    last_date_b = series_b.attrs.get("last_rebalance_date")
+                    raise ValueError(
+                        "Strategies appear identical for amount "
+                        f"{amount}: {strategy_a} vs {strategy_b}. "
+                        f"Last weights {strategy_a}@{last_date_a}={weights_a}, "
+                        f"{strategy_b}@{last_date_b}={weights_b}."
+                    )
 
 
 def assert_consistency(
@@ -777,6 +970,7 @@ def summarize_results(
     results: dict[str, dict[int, pd.Series]],
     benchmark_results: dict[str, dict[int, pd.Series]],
     amounts: tuple[int, ...],
+    rebalance_dates: pd.DatetimeIndex,
 ) -> pd.DataFrame:
     rows = []
     for strategy, amount_map in results.items():
@@ -787,6 +981,7 @@ def summarize_results(
             final_value = series.iloc[-1]
             profit = final_value - total_invested
             annual_return, annual_volatility = _annualized_metrics(series)
+            strategy_xirr = compute_xirr(_build_cashflows(series, amount, rebalance_dates))
             row = {
                 "Strategy": strategy,
                 "Amount": amount,
@@ -796,12 +991,16 @@ def summarize_results(
                 "Max Drawdown": compute_max_drawdown(series.dropna()),
                 "Annualized Return": annual_return,
                 "Annualized Volatility": annual_volatility,
+                "Strategy XIRR": strategy_xirr,
             }
             for name, amount_map in benchmark_results.items():
                 benchmark_series = amount_map[amount]
                 benchmark_final = benchmark_series.iloc[-1]
                 benchmark_profit = benchmark_final - total_invested
                 bench_ann_return, bench_ann_vol = _annualized_metrics(benchmark_series)
+                benchmark_xirr = compute_xirr(
+                    _build_cashflows(benchmark_series, amount, rebalance_dates)
+                )
                 row[f"{name} Final Value"] = benchmark_final
                 row[f"{name} Profit"] = benchmark_profit
                 row[f"{name} Max Drawdown"] = compute_max_drawdown(
@@ -809,6 +1008,7 @@ def summarize_results(
                 )
                 row[f"{name} Annualized Return"] = bench_ann_return
                 row[f"{name} Annualized Volatility"] = bench_ann_vol
+                row[f"{name} XIRR"] = benchmark_xirr
             if "NASDAQ" in benchmark_results:
                 row["Outperform_NASDAQ"] = (
                     final_value
@@ -832,6 +1032,7 @@ def plot_results(
     results: dict[str, dict[int, pd.Series]],
     benchmark_results: dict[str, dict[int, pd.Series]],
     amounts: tuple[int, ...],
+    run_id: str,
 ) -> None:
     benchmark_styles = {
         "Bitcoin": "--",
@@ -931,7 +1132,7 @@ def plot_results(
             title_fontsize=9,
         )
         fig.tight_layout()
-        fig.savefig(f"portfolio_{strategy}.png")
+        fig.savefig(f"portfolio_{strategy}_{run_id}.png")
         plt.close(fig)
 
 
@@ -1008,7 +1209,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    log("Starting simulation.")
+    run_id_source = f"{pd.Timestamp.utcnow().isoformat()}_{sorted(vars(args).items())}"
+    run_id_hash = hashlib.sha256(run_id_source.encode()).hexdigest()[:8]
+    run_id = f"{pd.Timestamp.utcnow():%Y%m%dT%H%M%SZ}_{run_id_hash}"
+    log(f"Starting simulation. Run ID: {run_id}")
     render_progress(0, 5, prefix="Setup ")
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(exist_ok=True)
@@ -1121,18 +1325,51 @@ def main() -> None:
         results[weighting] = {}
         for amount in config.amounts:
             log(f"Simulating amount {amount} units.")
-            results[weighting][amount] = simulate_portfolio_daily(
+            series = simulate_portfolio_daily(
                 prices, amount, config, rebalance_dates
             )
+            results[weighting][amount] = series
+            deposits_applied = series.attrs.get("deposits_applied", 0)
+            rebalances_executed = series.attrs.get("rebalances_executed", 0)
+            overlap_count = series.attrs.get("rebalance_overlap", 0)
+            log(
+                "Counters | "
+                f"{weighting} | {amount} | deposits={deposits_applied} | "
+                f"rebalances={rebalances_executed} | overlap={overlap_count}"
+            )
+            if deposits_applied != overlap_count:
+                raise ValueError(
+                    f"Deposit mismatch for {weighting} {amount}: "
+                    f"{deposits_applied} applied vs {overlap_count} expected."
+                )
+            if config.rebalance == "monthly" and rebalances_executed != deposits_applied:
+                raise ValueError(
+                    f"Rebalance mismatch for {weighting} {amount}: "
+                    f"{rebalances_executed} rebalances vs {deposits_applied} deposits."
+                )
 
     assert_consistency(results, benchmark_results)
-    summary = summarize_results(results, benchmark_results, config.amounts)
-    summary.to_csv("performance_summary.csv", index=False)
+    for strategy, amount_map in results.items():
+        for amount, series in amount_map.items():
+            for bench_name, bench_map in benchmark_results.items():
+                assert_not_identical_series(
+                    series,
+                    bench_map[amount],
+                    f"{strategy} {amount}",
+                    f"{bench_name} {amount}",
+                )
+    _assert_strategy_divergence(results, config.amounts)
+    summary = summarize_results(results, benchmark_results, config.amounts, rebalance_dates)
+    summary_path = f"performance_summary_{run_id}.csv"
+    summary.to_csv(summary_path, index=False)
     log("Simulation summary:")
     log(summary.to_string(index=False))
-    plot_results(results, benchmark_results, config.amounts)
+    plot_results(results, benchmark_results, config.amounts, run_id)
     render_progress(5, 5, prefix="Setup ")
-    log("Finished. Outputs: performance_summary.csv and portfolio_*.png files.")
+    log(
+        "Finished. Outputs: "
+        f"{summary_path} and portfolio_*_{run_id}.png files."
+    )
 
 
 if __name__ == "__main__":
