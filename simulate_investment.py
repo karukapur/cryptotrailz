@@ -583,6 +583,10 @@ def _default_fd_annual_rate() -> float:
     return 0.065
 
 
+def _default_fd_annual_rate() -> float:
+    return 0.065
+
+
 def compute_weights(
     prices: pd.DataFrame, weighting: str, window: int = 30
 ) -> pd.Series:
