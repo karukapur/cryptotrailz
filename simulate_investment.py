@@ -31,6 +31,7 @@ except ImportError as exc:  # pragma: no cover - handled at runtime
     ) from exc
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 # Treat cached data with fewer than 80% of expected rows as invalid.
 EXPECTED_COMPLETENESS_RATIO = 0.8
@@ -561,8 +562,7 @@ def _get_rebalance_dates(index: pd.DatetimeIndex, interval: str) -> pd.DatetimeI
 
 
 def _default_fd_annual_rate() -> float:
-    base_days = 444
-    return (1 + 0.0645) ** (365 / base_days) - 1
+    return 0.065
 
 
 def compute_weights(
@@ -665,7 +665,11 @@ def simulate_fixed_deposit(
     if index.empty:
         raise ValueError("Index is empty for fixed deposit simulation.")
     if index.tz is not None:
-        deposit_dates = deposit_dates.tz_localize("UTC") if deposit_dates.tz is None else deposit_dates
+        deposit_dates = (
+            deposit_dates.tz_localize("UTC")
+            if deposit_dates.tz is None
+            else deposit_dates
+        )
         index = index.tz_convert("UTC")
     else:
         deposit_dates = deposit_dates.tz_localize(None)
@@ -675,14 +679,24 @@ def simulate_fixed_deposit(
         raise ValueError("No deposit dates overlap with fixed deposit timeline.")
     deposit_dates = deposit_dates.sort_values()
 
+    total_invested = amount * len(deposit_dates)
+    start_date = deposit_dates[0]
+    end_date = index.max()
+    total_days = (end_date - start_date).days
+    total_days = max(total_days, 0)
+    end_value = total_invested * (1 + daily_rate) ** total_days
+
     wealth = pd.Series(index=index, dtype=float)
     for date in index:
-        active_deposits = deposit_dates[deposit_dates <= date]
-        if active_deposits.empty:
+        if date < start_date:
             wealth.loc[date] = 0.0
             continue
-        days_elapsed = (date - active_deposits).days
-        wealth.loc[date] = np.sum(amount * (1 + daily_rate) ** days_elapsed)
+        days_elapsed = (date - start_date).days
+        if total_days == 0:
+            wealth.loc[date] = end_value
+            continue
+        fraction = min(max(days_elapsed / total_days, 0), 1)
+        wealth.loc[date] = total_invested + (end_value - total_invested) * fraction
 
     wealth.attrs["contributions"] = len(deposit_dates)
     return wealth
@@ -749,25 +763,100 @@ def plot_results(
     benchmark_results: dict[str, dict[int, pd.Series]],
     amounts: tuple[int, ...],
 ) -> None:
+    benchmark_styles = {
+        "Bitcoin": "--",
+        "NASDAQ": (0, (5, 2)),
+        "Nifty50": (0, (3, 2, 1, 2)),
+        "Fixed Deposit": ":",
+    }
+    events = [
+        ("2024-11-06", "Trump win"),
+        ("2024-12-05", "ETF repricing"),
+        ("2025-02-25", "Tariff hack"),
+        ("2025-06-13", "Israel Iran"),
+        ("2025-10-05", "ETF ATH"),
+        ("2025-10-10", "Liquidation"),
+        ("2025-11-18", "Post peak"),
+        ("2025-12-26", "Flash wick"),
+        ("2026-01-19", "Tariff shock"),
+    ]
     for strategy, amount_map in results.items():
-        plt.figure(figsize=(12, 6))
+        plt.figure(figsize=(16, 8))
+        colors = plt.cm.tab10(np.linspace(0, 1, len(amounts)))
+        amount_colors = dict(zip(amounts, colors, strict=False))
         for amount in amounts:
             series = amount_map[amount]
-            plt.plot(series.index, series.values, label=f"{strategy} - {amount} units")
+            plt.plot(
+                series.index,
+                series.values,
+                color=amount_colors[amount],
+                linewidth=2,
+            )
 
             for benchmark_name, benchmark_map in benchmark_results.items():
                 benchmark_series = benchmark_map[amount]
                 plt.plot(
                     benchmark_series.index,
                     benchmark_series.values,
-                    linestyle="--",
-                    label=f"{benchmark_name} - {amount} units",
+                    color=amount_colors[amount],
+                    linestyle=benchmark_styles.get(benchmark_name, "--"),
+                    alpha=0.7,
+                )
+
+        plot_index = next(iter(amount_map.values())).index
+        max_value = max(series.max() for series in amount_map.values())
+        for date_str, label in events:
+            event_date = pd.Timestamp(date_str)
+            if plot_index.tz is not None and event_date.tz is None:
+                event_date = event_date.tz_localize(plot_index.tz)
+            if plot_index.min() <= event_date <= plot_index.max():
+                plt.axvline(event_date, color="grey", linestyle="--", alpha=0.4)
+                plt.text(
+                    event_date,
+                    max_value * 1.02,
+                    label,
+                    rotation=90,
+                    va="bottom",
+                    ha="center",
+                    fontsize=8,
                 )
 
         plt.title(f"Portfolio Value - {strategy} weighting")
         plt.xlabel("Date")
         plt.ylabel("Value (units)")
-        plt.legend()
+        amount_handles = [
+            Line2D([0], [0], color=amount_colors[amount], linewidth=2)
+            for amount in amounts
+        ]
+        amount_labels = [f"{amount} units" for amount in amounts]
+        benchmark_handles = [
+            Line2D([0], [0], color="black", linestyle="-", linewidth=2),
+            *[
+                Line2D(
+                    [0],
+                    [0],
+                    color="black",
+                    linestyle=benchmark_styles.get(name, "--"),
+                )
+                for name in benchmark_results.keys()
+            ],
+        ]
+        benchmark_labels = ["Crypto strategy", *list(benchmark_results.keys())]
+        legend_amounts = plt.legend(
+            amount_handles,
+            amount_labels,
+            title="Monthly Amount",
+            loc="upper left",
+            fontsize=9,
+        )
+        plt.gca().add_artist(legend_amounts)
+        plt.legend(
+            benchmark_handles,
+            benchmark_labels,
+            title="Series Type",
+            loc="upper right",
+            fontsize=9,
+        )
         plt.tight_layout()
         plt.savefig(f"portfolio_{strategy}.png")
         plt.close()
